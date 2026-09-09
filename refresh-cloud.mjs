@@ -417,6 +417,112 @@ async function fetchUniverse(coreStocks) {
   return out;
 }
 
+
+// ---- extended tier (every BIST symbol outside the core 100) ---------------
+// The core 100 gets full daily OHLC since 2021 on every run. Doing that for all
+// ~770 symbols on a 10-minute cron is not viable (thousands of requests, a
+// >10MB history.json every client would download), so the rest of the market
+// gets a lighter, once-a-day tier written to separate *Ext.json files that the
+// app fetches lazily — only when someone opens a non-100 stock.
+//
+// Enabled with FULL=1 (or --full). Close-only 1y history keeps the file small;
+// the chart falls back to line mode when OHLC is absent.
+const EXT_CONCURRENCY = 5;
+
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+async function buildExtended(coreSymbols) {
+  const seed = await readJson("universe-seed.json", []);
+  if (!seed.length) return null;
+  const core = new Set(coreSymbols);
+  const targets = seed.map((s) => s.symbol).filter((s) => !core.has(s));
+  if (!targets.length) return null;
+
+  const oneYearAgo = new Date(Date.now() - 370 * 864e5).toISOString().slice(0, 10);
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const technicals = {}, pivotsOut = {}, history = {}, fundamentals = {};
+  let done = 0, ok = 0;
+
+  await mapLimit(targets, EXT_CONCURRENCY, async (sym) => {
+    done++;
+    if (done % 25 === 0) process.stdout.write("\rExtended " + done + "/" + targets.length + "   ");
+    try {
+      const [ch, qs] = await Promise.all([
+        yf.chart(sym + ".IS", { period1: oneYearAgo, interval: "1d" }),
+        yf.quoteSummary(sym + ".IS", { modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile"] }).catch(() => null),
+      ]);
+      const rows = (ch.quotes || []).filter((r) => r.close != null);
+      if (rows.length < 30) return null; // too thin to compute anything honest
+      const closes = rows.map((r) => r.close);
+      const price = closes[closes.length - 1];
+
+      const e20 = ema(closes, 20), e50 = ema(closes, 50);
+      const sma20v = sma(closes, 20), sd20 = stdev(closes, 20);
+      const mac = macd(closes);
+      technicals[sym] = {
+        price: round(price, 2), sma20: round(sma20v, 2), ema20: round(e20, 2), ema50: round(e50, 2),
+        sma50: round(sma(closes, 50), 2), sma200: round(sma(closes, 200), 2),
+        bbUpper: sma20v != null && sd20 != null ? round(sma20v + 2 * sd20, 2) : null,
+        bbLower: sma20v != null && sd20 != null ? round(sma20v - 2 * sd20, 2) : null,
+        cross: detectCross(closes),
+        rsi: round(rsiWilder(closes), 1),
+        macd: mac ? round(mac.macd, 3) : null,
+        macdSignal: mac ? round(mac.signal, 3) : null,
+        macdHist: mac ? round(mac.hist, 3) : null,
+        trend: trendFrom(price, e20, e50),
+      };
+
+      const prevRows = rows.filter((r) => r.date.toISOString().slice(0, 10) < todayStr);
+      const base = prevRows[prevRows.length - 1] || rows[rows.length - 1];
+      if (base && base.high != null && base.low != null && base.close != null) {
+        const p = pivots(base.high, base.low, base.close);
+        pivotsOut[sym] = {
+          pp: round(p.pp, 2), s1: round(p.s1, 2), s2: round(p.s2, 2), s3: round(p.s3, 2),
+          r1: round(p.r1, 2), r2: round(p.r2, 2), r3: round(p.r3, 2),
+        };
+      }
+
+      const dts = rows.map((r) => r.date.toISOString().slice(0, 10));
+      history[sym] = { s: dts[0], e: dts[dts.length - 1], d: dts, c: closes.map((c) => round(c, 2)) };
+
+      if (qs) {
+        const sd = qs.summaryDetail || {}, ks = qs.defaultKeyStatistics || {};
+        const fd = qs.financialData || {}, ap = qs.assetProfile || {};
+        fundamentals[sym] = {
+          sector: mapSector(ap.sector),
+          marketCap: sd.marketCap != null ? Math.round(sd.marketCap) : null,
+          pe: round(sd.trailingPE, 2),
+          pb: round(ks.priceToBook, 2),
+          roe: round(fd.returnOnEquity, 4),
+          w52low: round(sd.fiftyTwoWeekLow, 2),
+          w52high: round(sd.fiftyTwoWeekHigh, 2),
+          divYield: round(sd.dividendYield, 4),
+        };
+      }
+      ok++;
+    } catch {
+      /* a delisted or illiquid ticker simply stays out of the extended tier */
+    }
+    return null;
+  });
+
+  process.stdout.write("\n");
+  console.log("  extended: " + ok + "/" + targets.length + " sembol hesaplandı");
+  return { technicals, pivots: pivotsOut, history, fundamentals };
+}
+
 // ---- main ----------------------------------------------------------------
 async function main() {
   const prevStocks = await readJson("stocks.json", { stocks: [], macro: [] });
@@ -592,6 +698,16 @@ async function main() {
   const marketNews = await fetchMarketNews(stocks, prevMarketNews);
   if (marketNews.skipped) console.log("  (market news atlandı — saat başı çalışır)");
 
+  // 3c2) Extended tier for every non-core symbol (FULL=1 / --full only).
+  const wantFull = process.env.FULL === "1" || process.argv.includes("--full");
+  let extended = null;
+  if (wantFull) {
+    console.log("Fetching extended tier (non-100 charts + indicators)…");
+    extended = await buildExtended(symbols);
+  } else {
+    console.log("Extended tier atlandı (FULL=1 ile çalıştır).");
+  }
+
   // 3d) Full BIST universe (light price+change) for search beyond BIST 100.
   console.log("Fetching universe (all BIST light)…");
   const universe = await fetchUniverse(stocks);
@@ -608,6 +724,15 @@ async function main() {
   await fs.writeFile(path.join(DATA_DIR, "history.json"), JSON.stringify(history));
   await fs.writeFile(path.join(DATA_DIR, "fundamentals.json"), JSON.stringify(fundamentals));
   if (universe) await fs.writeFile(path.join(DATA_DIR, "universe.json"), JSON.stringify(universe));
+  // Extended files are only rewritten on a FULL run — a fast run must never
+  // blank them out.
+  if (extended) {
+    await fs.writeFile(path.join(DATA_DIR, "technicalsExt.json"), JSON.stringify(extended.technicals));
+    await fs.writeFile(path.join(DATA_DIR, "pivotsExt.json"), JSON.stringify(extended.pivots));
+    await fs.writeFile(path.join(DATA_DIR, "historyExt.json"), JSON.stringify(extended.history));
+    await fs.writeFile(path.join(DATA_DIR, "fundamentalsExt.json"), JSON.stringify(extended.fundamentals));
+    console.log("  extended dosyaları yazıldı: " + Object.keys(extended.history).length + " sembol");
+  }
   await fs.writeFile(path.join(DATA_DIR, "markets.json"), JSON.stringify({ updatedAt, ...markets }));
   const newsCount = Object.keys(news).length;
   // only overwrite news.json if we actually got fresh data (fetchNews returns prevNews on failure)

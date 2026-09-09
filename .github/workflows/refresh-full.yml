@@ -1,0 +1,47 @@
+name: Refresh data (full)
+
+# Günde bir kez: normal yenilemeye ek olarak BIST 100 DIŞINDAKİ tüm sembollerin
+# 1 yıllık grafik + gösterge + pivot verisini üretir (*Ext.json).
+#
+# Neden ayrı: 10 dakikalık cron'da ~770 sembol için grafik çekmek hem Yahoo'yu
+# zorlar hem de her koşuyu dakikalarca uzatır. Bu iş seans öncesi bir kez koşar;
+# uygulama bu dosyaları yalnızca 100 dışı bir hisse açıldığında indirir.
+
+on:
+  schedule:
+    # 03:40 UTC = 06:40 TSİ — seans açılmadan önce.
+    - cron: "40 3 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# Hızlı yenilemeyle aynı grup: ikisi aynı anda data/ yazmasın.
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+      - run: FULL=1 node refresh-cloud.mjs
+        continue-on-error: true
+      - name: Commit refreshed data
+        run: |
+          git config user.name "bist-nabiz-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "Veri değişmedi — commit yok."
+          else
+            git commit -m "data: tam yenileme ($(date -u +%Y-%m-%dT%H:%MZ))"
+            git pull --rebase --autostash origin main || true
+            git push
+          fi
