@@ -1,0 +1,42 @@
+name: Refresh data
+
+# Veriyi (Yahoo + KAP + Google News) tazeler ve data/ klasörünü commit'ler.
+# Uygulama bu dosyaları raw.githubusercontent.com ile canlı çeker — hiçbir
+# site build'i tetiklenmez, hiçbir hosting limitine takılmaz.
+
+on:
+  schedule:
+    # Her 15 dk, hafta içi, ~10:00–18:45 TSİ (UTC+3 → 07:00–15:45 UTC)
+    - cron: "*/15 7-15 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+      - run: node refresh-cloud.mjs
+        continue-on-error: true
+      - name: Commit refreshed data
+        run: |
+          git config user.name "bist-nabiz-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "Veri değişmedi — commit yok."
+          else
+            git commit -m "data: otomatik yenileme ($(date -u +%Y-%m-%dT%H:%MZ))"
+            git pull --rebase --autostash origin main || true
+            git push
+          fi

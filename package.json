@@ -1,0 +1,13 @@
+{
+  "name": "bist-nabiz-data",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "description": "BIST Nabız için otomatik yenilenen veri (JSON). Uygulama bunu raw ile çeker.",
+  "scripts": {
+    "refresh": "node refresh-cloud.mjs"
+  },
+  "dependencies": {
+    "yahoo-finance2": "^4.0.2"
+  }
+}
