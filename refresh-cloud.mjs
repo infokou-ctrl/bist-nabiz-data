@@ -384,6 +384,39 @@ async function fetchMarkets(prevMarkets) {
   return { fx, inflation };
 }
 
+// ---- universe (all BIST, light: price + change) --------------------------
+// One batched Yahoo quote per ~50 symbols. No history/indicators (that stays
+// core-100 only) — just enough so non-100 stocks show price/change on search.
+async function fetchUniverse(coreStocks) {
+  const seed = await readJson("universe-seed.json", []); // [{symbol,name}]
+  if (!seed.length) return null;
+  const coreMap = {};
+  for (const s of coreStocks) coreMap[s.symbol] = s;
+  const out = [];
+  const CH = 50;
+  for (let i = 0; i < seed.length; i += CH) {
+    const part = seed.slice(i, i + CH);
+    process.stdout.write("\rUniverse " + Math.min(i + CH, seed.length) + "/" + seed.length + "   ");
+    try {
+      const arr = await yf.quote(part.map((s) => s.symbol + ".IS"));
+      const bym = {};
+      for (const q of Array.isArray(arr) ? arr : [arr]) bym[(q.symbol || "").replace(".IS", "")] = q;
+      for (const s of part) {
+        const core = coreMap[s.symbol], q = bym[s.symbol];
+        out.push({
+          symbol: s.symbol, name: s.name,
+          close: core ? core.close : (q ? round(q.regularMarketPrice, 2) : null),
+          change: core ? core.change : (q ? round(q.regularMarketChangePercent, 2) : null),
+        });
+      }
+    } catch {
+      for (const s of part) out.push({ symbol: s.symbol, name: s.name, close: null, change: null });
+    }
+  }
+  process.stdout.write("\n");
+  return out;
+}
+
 // ---- main ----------------------------------------------------------------
 async function main() {
   const prevStocks = await readJson("stocks.json", { stocks: [], macro: [] });
@@ -556,6 +589,10 @@ async function main() {
   const marketNews = await fetchMarketNews(stocks, prevMarketNews);
   if (marketNews.skipped) console.log("  (market news atlandı — saat başı çalışır)");
 
+  // 3d) Full BIST universe (light price+change) for search beyond BIST 100.
+  console.log("Fetching universe (all BIST light)…");
+  const universe = await fetchUniverse(stocks);
+
   // 4) Write — fast data fresh; details/news preserved (change slowly).
   const updatedAt = new Date().toISOString();
   // details: keep previously-seeded entries for any symbol Yahoo didn't return.
@@ -567,6 +604,7 @@ async function main() {
   await fs.writeFile(path.join(DATA_DIR, "pivots.json"), JSON.stringify(pivotsOut));
   await fs.writeFile(path.join(DATA_DIR, "history.json"), JSON.stringify(history));
   await fs.writeFile(path.join(DATA_DIR, "fundamentals.json"), JSON.stringify(fundamentals));
+  if (universe) await fs.writeFile(path.join(DATA_DIR, "universe.json"), JSON.stringify(universe));
   await fs.writeFile(path.join(DATA_DIR, "markets.json"), JSON.stringify({ updatedAt, ...markets }));
   const newsCount = Object.keys(news).length;
   // only overwrite news.json if we actually got fresh data (fetchNews returns prevNews on failure)
