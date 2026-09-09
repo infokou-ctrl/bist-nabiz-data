@@ -578,10 +578,13 @@ async function main() {
   console.log("Fetching markets (FX + gold)…");
   const markets = await fetchMarkets(prevMarkets);
 
-  // 3b) KAP disclosures (news).
+  // 3b) KAP disclosures (news) — for the FULL BIST universe, so non-100 favourites
+  // (e.g. SELEC) also get their official KAP filings, not just the core 100.
   console.log("Fetching KAP disclosures…");
   const prevNews = await readJson("news.json", {});
-  const news = await fetchNews(symbols, prevNews);
+  const uniSeedForNews = await readJson("universe-seed.json", []);
+  const newsSymbols = [...new Set([...symbols, ...uniSeedForNews.map((s) => s.symbol)])];
+  const news = await fetchNews(newsSymbols, prevNews);
 
   // 3c) Market news from the press (Google News RSS, hourly).
   console.log("Fetching market news (Google News)…");
