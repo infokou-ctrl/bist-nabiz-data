@@ -292,6 +292,57 @@ function parseRssItems(xml) {
   return items;
 }
 
+// Is this headline actually about THIS company?
+//
+// Two ways to qualify: the headline names the company (or its spaceless brand
+// form), or it carries the ticker AS WRITTEN IN THE FINANCIAL PRESS — i.e. in
+// caps — together with a finance word. The ticker test used to be
+// case-insensitive with no context requirement, which filed "Mescid-i Aksa"
+// under AKSA; ordinary proper nouns collide with three- and four-letter tickers
+// constantly, so a bare ticker match is not evidence on its own.
+// Words that mark a headline as being about a COMPANY (markets or operations),
+// used to qualify weak identifiers.
+//
+// Deliberately phrase-based, not single short stems. JavaScript's \b is
+// ASCII-only, so Turkish letters do NOT count as word characters: /\bkar\b/
+// happily matches "karşı" (ş is a non-word char to the engine) and /\balım\b/
+// matches nothing useful while /alım/ matched "Alimleri". Both mistakes filed
+// Gaza headlines under AKSA. Keep tokens long or anchored in a phrase.
+const COMPANY_CTX = new RegExp(
+  [
+    "hisse", "borsa", "\\bbist\\b", "sermaye", "bilan[çc]o", "temett[üu]",
+    "net k[âa]r", "k[âa]r pay", "zarar", "yat[ıi]r[ıi]m", "halka arz", "halka a[çc][ıi]l",
+    "s[öo]zle[şs]me", "ihale", "sat[ıi][şs]", "sat[ıi]n al", "pay al", "pay sat",
+    "geri al[ıi]m", "blok al[ıi]m", "endeks", "piyasa", "\\bfon\\b", "[üu]retim",
+    "fabrika", "tesis", "ihracat", "rafineri", "kapasite", "\\bceo\\b",
+    "genel m[üu]d[üu]r", "y[öo]netim kurulu", "\\bkap\\b", "birle[şs]me",
+    "\\bmarka", "\\bkota", "bedelsiz", "sermaye art",
+  ].join("|"),
+  "i",
+);
+
+function makeRelevance(stock) {
+  const name = cleanCompanyName(stock.name);
+  const ns = name.replace(/\s+/g, "");
+  const norm = (x) => x.toLocaleLowerCase("tr").normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+  const nName = norm(name), nNs = norm(ns);
+  const tickerRe = new RegExp("\\b" + stock.symbol + "\\b"); // case-SENSITIVE
+  // A one-word company name carries no more information than the ticker — for
+  // AKSA the stored name IS "AKSA", so matching it case-insensitively filed
+  // every "Mescid-i Aksa" headline under the stock. Weak identifiers have to be
+  // backed by a company-context word; multi-word names are specific enough.
+  const weakName = nName.split(/\s+/).filter(Boolean).length < 2;
+  return (title) => {
+    const raw = title || "";
+    const t = norm(raw);
+    const ctx = COMPANY_CTX.test(raw);
+    const byName = (nName.length >= 4 && t.includes(nName)) ||
+      (nNs !== nName && nNs.length >= 4 && t.includes(nNs));
+    if (byName) return weakName ? ctx : true;
+    return tickerRe.test(raw) && ctx;
+  };
+}
+
 async function fetchMarketNews(stocks, prev) {
   const prevItems = (prev && prev.items) || {};
   // Gate: only run when the CI wall-clock is in the first quarter-hour (≈ hourly),
@@ -300,8 +351,20 @@ async function fetchMarketNews(stocks, prev) {
   if (!force && new Date().getUTCMinutes() >= 15) {
     return { updatedAt: (prev && prev.updatedAt) || null, items: prevItems, skipped: true };
   }
+  const relevanceBySym = {};
+  for (const s of stocks) relevanceBySym[s.symbol] = makeRelevance(s);
+
+  // Re-check the stored archive against the CURRENT filter, so tightening it
+  // also cleans out items an earlier, looser version let through.
   const out = {};
-  for (const [sym, items] of Object.entries(prevItems)) out[sym] = items.slice();
+  let purged = 0;
+  for (const [sym, items] of Object.entries(prevItems)) {
+    const rel = relevanceBySym[sym];
+    if (!rel) { out[sym] = items.slice(); continue; }
+    out[sym] = items.filter((n) => rel(n.title || ""));
+    purged += items.length - out[sym].length;
+  }
+  if (purged) console.log("  arşivden elenen alakasız haber: " + purged);
   const seen = {};
   for (const sym of Object.keys(out)) seen[sym] = new Set(out[sym].map((n) => (n.title || "").toLowerCase()));
 
@@ -317,18 +380,7 @@ async function fetchMarketNews(stocks, prev) {
     const nameClause = ns !== name ? '("' + name + '" OR "' + ns + '")' : '"' + name + '"';
     const query = nameClause + " (borsa OR hisse OR BIST OR " + s.symbol + " OR şirket) when:10d";
     const url = "https://news.google.com/rss/search?q=" + encodeURIComponent(query) + "&hl=tr&gl=TR&ceid=TR:tr";
-    // Precision: keep only headlines that actually name THIS company (name/brand),
-    // or carry its ticker as a whole latin word — drops generic "Borsa'da bugün /
-    // faiz kararı" items that merely matched a finance keyword.
-    const norm = (x) => x.toLocaleLowerCase("tr").normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
-    const nName = norm(name), nNs = norm(ns);
-    const tickerRe = new RegExp("\\b" + s.symbol + "\\b", "i");
-    const relevant = (title) => {
-      const t = norm(title);
-      return (nName.length >= 4 && t.includes(nName)) ||
-        (nNs !== nName && nNs.length >= 4 && t.includes(nNs)) ||
-        tickerRe.test(title);
-    };
+    const relevant = relevanceBySym[s.symbol] || (() => false);
     try {
       const ctrl = AbortSignal.timeout ? AbortSignal.timeout(9000) : undefined;
       const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: ctrl });
