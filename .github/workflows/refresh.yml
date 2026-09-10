@@ -23,13 +23,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Manuel çalışma kilidi: data/PAUSE dosyası varsa cron bu koşuyu atlar.
+      # Böylece yerelde veri üretip commit'lerken bot araya girip çakışma
+      # yaratmaz. Elle tetiklemede (workflow_dispatch) kilit YOK SAYILIR.
+      - name: Duraklatma kilidi
+        id: guard
+        run: |
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ -f data/PAUSE ]; then
+            echo "paused=true" >> "$GITHUB_OUTPUT"
+            echo "⏸  data/PAUSE var — otomatik koşu atlandı. (Elle tetiklemede yok sayılır.)"
+          else
+            echo "paused=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-node@v4
+        if: steps.guard.outputs.paused == 'false'
         with:
           node-version: "20"
       - run: npm install --no-audit --no-fund
+        if: steps.guard.outputs.paused == 'false'
       - run: node refresh-cloud.mjs
+        if: steps.guard.outputs.paused == 'false'
         continue-on-error: true
       - name: Commit refreshed data
+        if: steps.guard.outputs.paused == 'false'
         run: |
           git config user.name "bist-nabiz-bot"
           git config user.email "actions@users.noreply.github.com"

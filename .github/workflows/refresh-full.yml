@@ -27,13 +27,26 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Duraklatma kilidi
+        id: guard
+        run: |
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ -f data/PAUSE ]; then
+            echo "paused=true" >> "$GITHUB_OUTPUT"
+            echo "⏸  data/PAUSE var — otomatik koşu atlandı."
+          else
+            echo "paused=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-node@v4
+        if: steps.guard.outputs.paused == 'false'
         with:
           node-version: "20"
       - run: npm install --no-audit --no-fund
+        if: steps.guard.outputs.paused == 'false'
       - run: FULL=1 node refresh-cloud.mjs
+        if: steps.guard.outputs.paused == 'false'
         continue-on-error: true
       - name: Commit refreshed data
+        if: steps.guard.outputs.paused == 'false'
         run: |
           git config user.name "bist-nabiz-bot"
           git config user.email "actions@users.noreply.github.com"

@@ -405,6 +405,43 @@ async function fetchMarketNews(stocks, prev) {
   return { updatedAt: new Date().toISOString(), items: out };
 }
 
+// ---- index history -------------------------------------------------------
+// The OFFICIAL Borsa İstanbul indices (free-float market-cap weighted) — a
+// different, more authoritative series than the app's own equal-weight average.
+// BIST 50 is intentionally omitted: Yahoo has no usable history for XU050 (one
+// day only), and a chart built from a single point would be a lie.
+async function fetchIndexHistory(startDate) {
+  const defs = [
+    { code: "XU100", yh: "XU100.IS", label: "BIST 100" },
+    { code: "XU030", yh: "XU030.IS", label: "BIST 30" },
+  ];
+  const out = {};
+  for (const d of defs) {
+    try {
+      const [ch, q] = await Promise.all([
+        yf.chart(d.yh, { period1: startDate, interval: "1d" }),
+        yf.quote(d.yh).catch(() => null),
+      ]);
+      const rows = (ch.quotes || []).filter((r) => r.close != null);
+      if (rows.length < 100) continue;
+      const ds = rows.map((r) => r.date.toISOString().slice(0, 10));
+      out[d.code] = {
+        code: d.code, label: d.label,
+        value: q ? round(q.regularMarketPrice, 2) : round(rows[rows.length - 1].close, 2),
+        change: q ? round(q.regularMarketChangePercent, 2) : null,
+        d: ds,
+        o: rows.map((r) => round(r.open, 2)),
+        h: rows.map((r) => round(r.high, 2)),
+        l: rows.map((r) => round(r.low, 2)),
+        c: rows.map((r) => round(r.close, 2)),
+      };
+    } catch (e) {
+      console.log("  " + d.code + " geçmişi alınamadı: " + e.message);
+    }
+  }
+  return out;
+}
+
 // ---- FX history ----------------------------------------------------------
 // Daily closes for the currencies a BIST investor actually measures against.
 // Needed because "what did this stock do in dollars" cannot be answered with
@@ -845,6 +882,9 @@ async function main() {
   console.log("Fetching FX history…");
   const fxHistory = await fetchFxHistory(HISTORY_START);
 
+  console.log("Fetching index history…");
+  const indices = await fetchIndexHistory(HISTORY_START);
+
   // 3b) KAP disclosures (news) — for the FULL BIST universe, so non-100 favourites
   // (e.g. SELEC) also get their official KAP filings, not just the core 100.
   console.log("Fetching KAP disclosures…");
@@ -901,6 +941,10 @@ async function main() {
   if (fxHistory && fxHistory.USD && fxHistory.USD.c.length > 100) {
     await fs.writeFile(path.join(DATA_DIR, "fxHistory.json"), JSON.stringify(fxHistory));
     console.log("  fxHistory: " + Object.keys(fxHistory).join(", ") + " · " + fxHistory.USD.c.length + " gün");
+  }
+  if (indices && Object.keys(indices).length) {
+    await fs.writeFile(path.join(DATA_DIR, "indices.json"), JSON.stringify(indices));
+    console.log("  indices: " + Object.keys(indices).map((k) => k + " " + indices[k].c.length + "g").join(", "));
   }
   const newsCount = Object.keys(news).length;
   // only overwrite news.json if we actually got fresh data (fetchNews returns prevNews on failure)
