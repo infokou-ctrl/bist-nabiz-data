@@ -405,6 +405,19 @@ async function fetchMarketNews(stocks, prev) {
   return { updatedAt: new Date().toISOString(), items: out };
 }
 
+// Analyst recommendation distribution (latest month). Reported as raw counts —
+// the panel never distils these into its own AL/SAT verdict; it shows what the
+// covering brokerages collectively think, attributed.
+function recTrend(qs) {
+  const t = qs && qs.recommendationTrend && qs.recommendationTrend.trend && qs.recommendationTrend.trend[0];
+  if (!t) return {};
+  const buy = (t.strongBuy || 0) + (t.buy || 0);
+  const hold = t.hold || 0;
+  const sell = (t.sell || 0) + (t.strongSell || 0);
+  if (buy + hold + sell === 0) return {};
+  return { recBuy: buy, recHold: hold, recSell: sell };
+}
+
 // ---- index history -------------------------------------------------------
 // The OFFICIAL Borsa İstanbul indices (free-float market-cap weighted) — a
 // different, more authoritative series than the app's own equal-weight average.
@@ -599,7 +612,7 @@ async function buildExtended(coreSymbols) {
       const [ch, qs] = await Promise.all([
         yf.chart(sym + ".IS", { period1: oneYearAgo, interval: "1d" }),
         yf.quoteSummary(sym + ".IS", {
-          modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents"],
+          modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents", "recommendationTrend"],
         }).catch(() => null),
       ]);
       const rows = (ch.quotes || []).filter((r) => r.close != null);
@@ -655,6 +668,7 @@ async function buildExtended(coreSymbols) {
           tgtMean: round(fd.targetMeanPrice, 2),
           tgtHigh: round(fd.targetHighPrice, 2),
           analysts: fd.numberOfAnalystOpinions != null ? Math.round(fd.numberOfAnalystOpinions) : null,
+          ...recTrend(qs),
         };
 
         // Dividend / earnings for the modal's stat tiles + timeline. The core
@@ -757,7 +771,7 @@ async function main() {
       const [ch, qs] = await Promise.all([
         yf.chart(sym + ".IS", { period1: start, interval: "1d" }),
         yf.quoteSummary(sym + ".IS", {
-          modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents"],
+          modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents", "recommendationTrend"],
         }).catch(() => null),
       ]);
       if (qs) {
@@ -781,6 +795,7 @@ async function main() {
           tgtMean: round(fd.targetMeanPrice, 2),
           tgtHigh: round(fd.targetHighPrice, 2),
           analysts: fd.numberOfAnalystOpinions != null ? Math.round(fd.numberOfAnalystOpinions) : null,
+          ...recTrend(qs),
         };
 
         // Enrich details.json (dividend / EPS / earnings) — preserve timeline + name.
