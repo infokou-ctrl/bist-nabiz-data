@@ -405,6 +405,52 @@ async function fetchMarketNews(stocks, prev) {
   return { updatedAt: new Date().toISOString(), items: out };
 }
 
+// ---- FX history ----------------------------------------------------------
+// Daily closes for the currencies a BIST investor actually measures against.
+// Needed because "what did this stock do in dollars" cannot be answered with
+// today's rate alone — every past price has to be divided by the rate on ITS
+// day. With TRY inflation running as it does, the TRY chart and the USD chart
+// of the same stock can tell opposite stories, so this is not a garnish.
+async function fetchFxHistory(startDate) {
+  const out = {};
+  const series = async (yhSymbol) => {
+    const ch = await yf.chart(yhSymbol, { period1: startDate, interval: "1d" });
+    const rows = (ch.quotes || []).filter((r) => r.close != null);
+    return {
+      d: rows.map((r) => r.date.toISOString().slice(0, 10)),
+      c: rows.map((r) => r.close),
+    };
+  };
+  try {
+    const [usd, eur, gbp] = await Promise.all([
+      series("USDTRY=X"),
+      series("EURTRY=X").catch(() => null),
+      series("GBPTRY=X").catch(() => null),
+    ]);
+    out.USD = { d: usd.d, c: usd.c.map((v) => round(v, 4)) };
+    if (eur) out.EUR = { d: eur.d, c: eur.c.map((v) => round(v, 4)) };
+    if (gbp) out.GBP = { d: gbp.d, c: gbp.c.map((v) => round(v, 4)) };
+
+    // Gram gold in TRY = (gold USD/oz on that day) × (USDTRY that day) / 31.1034768
+    try {
+      const gold = await series("GC=F");
+      const usdBy = new Map(usd.d.map((d, i) => [d, usd.c[i]]));
+      const d = [], c = [];
+      for (let i = 0; i < gold.d.length; i++) {
+        const rate = usdBy.get(gold.d[i]);
+        if (rate == null) continue; // no FX print that day — skip rather than guess
+        d.push(gold.d[i]);
+        c.push(round((gold.c[i] * rate) / 31.1034768, 2));
+      }
+      if (d.length > 30) out.XAU = { d, c };
+    } catch { /* gold history optional */ }
+  } catch (e) {
+    console.log("  FX geçmişi alınamadı: " + e.message);
+    return null;
+  }
+  return out;
+}
+
 // ---- markets (FX + gold) -------------------------------------------------
 async function fetchMarkets(prevMarkets) {
   const fx = [];
@@ -565,6 +611,13 @@ async function buildExtended(coreSymbols) {
           w52low: round(sd.fiftyTwoWeekLow, 2),
           w52high: round(sd.fiftyTwoWeekHigh, 2),
           divYield: round(sd.dividendYield, 4),
+          // Third-party 12-month price targets. Reported, never generated here:
+          // the panel's own guardrail forbids IT from naming a price, but what
+          // brokerages publish is a fact about the market and belongs on the page.
+          tgtLow: round(fd.targetLowPrice, 2),
+          tgtMean: round(fd.targetMeanPrice, 2),
+          tgtHigh: round(fd.targetHighPrice, 2),
+          analysts: fd.numberOfAnalystOpinions != null ? Math.round(fd.numberOfAnalystOpinions) : null,
         };
 
         // Dividend / earnings for the modal's stat tiles + timeline. The core
@@ -684,6 +737,13 @@ async function main() {
           w52low: round(sd.fiftyTwoWeekLow, 2),
           w52high: round(sd.fiftyTwoWeekHigh, 2),
           divYield: round(sd.dividendYield, 4),
+          // Third-party 12-month price targets. Reported, never generated here:
+          // the panel's own guardrail forbids IT from naming a price, but what
+          // brokerages publish is a fact about the market and belongs on the page.
+          tgtLow: round(fd.targetLowPrice, 2),
+          tgtMean: round(fd.targetMeanPrice, 2),
+          tgtHigh: round(fd.targetHighPrice, 2),
+          analysts: fd.numberOfAnalystOpinions != null ? Math.round(fd.numberOfAnalystOpinions) : null,
         };
 
         // Enrich details.json (dividend / EPS / earnings) — preserve timeline + name.
@@ -781,6 +841,10 @@ async function main() {
   console.log("Fetching markets (FX + gold)…");
   const markets = await fetchMarkets(prevMarkets);
 
+  // 3a) FX history — lets the app redraw any chart in USD/EUR/GBP/gram gold.
+  console.log("Fetching FX history…");
+  const fxHistory = await fetchFxHistory(HISTORY_START);
+
   // 3b) KAP disclosures (news) — for the FULL BIST universe, so non-100 favourites
   // (e.g. SELEC) also get their official KAP filings, not just the core 100.
   console.log("Fetching KAP disclosures…");
@@ -832,6 +896,12 @@ async function main() {
     console.log("  extended dosyaları yazıldı: " + Object.keys(extended.history).length + " sembol");
   }
   await fs.writeFile(path.join(DATA_DIR, "markets.json"), JSON.stringify({ updatedAt, ...markets }));
+  // Only overwrite when the fetch actually worked — a failed run must not blank
+  // the series and silently break every foreign-currency chart.
+  if (fxHistory && fxHistory.USD && fxHistory.USD.c.length > 100) {
+    await fs.writeFile(path.join(DATA_DIR, "fxHistory.json"), JSON.stringify(fxHistory));
+    console.log("  fxHistory: " + Object.keys(fxHistory).join(", ") + " · " + fxHistory.USD.c.length + " gün");
+  }
   const newsCount = Object.keys(news).length;
   // only overwrite news.json if we actually got fresh data (fetchNews returns prevNews on failure)
   if (news !== prevNews) await fs.writeFile(path.join(DATA_DIR, "news.json"), JSON.stringify(news));
