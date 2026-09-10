@@ -452,7 +452,9 @@ async function buildExtended(coreSymbols) {
 
   const oneYearAgo = new Date(Date.now() - 370 * 864e5).toISOString().slice(0, 10);
   const todayStr = new Date().toISOString().slice(0, 10);
-  const technicals = {}, pivotsOut = {}, history = {}, fundamentals = {};
+  const technicals = {}, pivotsOut = {}, history = {}, fundamentals = {}, details = {};
+  const nameOf = {};
+  for (const row of seed) nameOf[row.symbol] = row.name;
   let done = 0, ok = 0;
 
   await mapLimit(targets, EXT_CONCURRENCY, async (sym) => {
@@ -461,7 +463,9 @@ async function buildExtended(coreSymbols) {
     try {
       const [ch, qs] = await Promise.all([
         yf.chart(sym + ".IS", { period1: oneYearAgo, interval: "1d" }),
-        yf.quoteSummary(sym + ".IS", { modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile"] }).catch(() => null),
+        yf.quoteSummary(sym + ".IS", {
+          modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents"],
+        }).catch(() => null),
       ]);
       const rows = (ch.quotes || []).filter((r) => r.close != null);
       if (rows.length < 30) return null; // too thin to compute anything honest
@@ -510,6 +514,47 @@ async function buildExtended(coreSymbols) {
           w52high: round(sd.fiftyTwoWeekHigh, 2),
           divYield: round(sd.dividendYield, 4),
         };
+
+        // Dividend / earnings for the modal's stat tiles + timeline. The core
+        // 100 gets a richer, Borsa_MCP-seeded timeline; here we can only build
+        // it from what Yahoo returns, so it holds the two facts we actually
+        // know rather than pretending to a full history.
+        const ce = qs.calendarEvents || {};
+        const today = new Date().toISOString().slice(0, 10);
+        const earnDates = (ce.earnings && ce.earnings.earningsDate) || [];
+        const nextEarn = (Array.isArray(earnDates) ? earnDates : [earnDates])
+          .map(isoDate).filter((d) => d && d >= today).sort()[0] || null;
+        const lastDivDate = isoDate(ks.lastDividendDate);
+        const lastDivVal = ks.lastDividendValue != null ? round(ks.lastDividendValue, 4) : null;
+        const lastDividend = lastDivDate && lastDivVal != null ? { date: lastDivDate, amount: lastDivVal } : null;
+
+        const timeline = [];
+        if (nextEarn) {
+          timeline.push({
+            date: nextEarn, type: "earnings", future: true,
+            label: "Bilanço açıklaması (beklenen)",
+            detail: "Yahoo Finance takviminden alınan beklenen tarih; şirket teyit etmemiş olabilir.",
+          });
+        }
+        if (lastDividend) {
+          timeline.push({
+            date: lastDividend.date, type: "dividend", future: false,
+            label: "Son ödenen temettü",
+            detail: "Hisse başına " + String(lastDividend.amount).replace(".", ",") + " TL.",
+          });
+        }
+        timeline.sort((a, b) => b.date.localeCompare(a.date));
+
+        details[sym] = {
+          symbol: sym,
+          name: nameOf[sym] || sym,
+          annualDividend: sd.dividendRate != null ? round(sd.dividendRate, 4) : null,
+          nextDividend: null,
+          lastDividend,
+          nextEarningsDate: nextEarn,
+          epsTtm: ks.trailingEps != null ? round(ks.trailingEps, 4) : null,
+          timeline,
+        };
       }
       ok++;
     } catch {
@@ -520,7 +565,7 @@ async function buildExtended(coreSymbols) {
 
   process.stdout.write("\n");
   console.log("  extended: " + ok + "/" + targets.length + " sembol hesaplandı");
-  return { technicals, pivots: pivotsOut, history, fundamentals };
+  return { technicals, pivots: pivotsOut, history, fundamentals, details };
 }
 
 // ---- main ----------------------------------------------------------------
@@ -731,6 +776,7 @@ async function main() {
     await fs.writeFile(path.join(DATA_DIR, "pivotsExt.json"), JSON.stringify(extended.pivots));
     await fs.writeFile(path.join(DATA_DIR, "historyExt.json"), JSON.stringify(extended.history));
     await fs.writeFile(path.join(DATA_DIR, "fundamentalsExt.json"), JSON.stringify(extended.fundamentals));
+    await fs.writeFile(path.join(DATA_DIR, "detailsExt.json"), JSON.stringify(extended.details));
     console.log("  extended dosyaları yazıldı: " + Object.keys(extended.history).length + " sembol");
   }
   await fs.writeFile(path.join(DATA_DIR, "markets.json"), JSON.stringify({ updatedAt, ...markets }));
