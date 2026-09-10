@@ -405,6 +405,35 @@ async function fetchMarketNews(stocks, prev) {
   return { updatedAt: new Date().toISOString(), items: out };
 }
 
+// Quarterly + yearly revenue / net income / margins — the numbers a real
+// financial page leads with. Yahoo's earnings.financialsChart is the reliable
+// source (the raw incomeStatement submodules went empty in 2024).
+function financials(qs, fd) {
+  const fc = qs && qs.earnings && qs.earnings.financialsChart;
+  if (!fc) return {};
+  const map = (arr) =>
+    (arr || [])
+      .filter((r) => r && (r.revenue != null || r.earnings != null))
+      .map((r) => ({
+        p: String(r.date),
+        rev: r.revenue != null ? Math.round(r.revenue) : null,
+        ni: r.earnings != null ? Math.round(r.earnings) : null,
+        m: r.profitMargin != null ? round(r.profitMargin, 4) : null,
+      }));
+  const q = map(fc.quarterly), y = map(fc.yearly);
+  if (!q.length && !y.length) return {};
+  return {
+    fin: {
+      q, y,
+      grossM: round(fd.grossMargins, 4),
+      opM: round(fd.operatingMargins, 4),
+      netM: round(fd.profitMargins, 4),
+      revG: round(fd.revenueGrowth, 4),
+      epsG: round(fd.earningsGrowth, 4),
+    },
+  };
+}
+
 // Analyst recommendation distribution (latest month). Reported as raw counts —
 // the panel never distils these into its own AL/SAT verdict; it shows what the
 // covering brokerages collectively think, attributed.
@@ -612,7 +641,7 @@ async function buildExtended(coreSymbols) {
       const [ch, qs] = await Promise.all([
         yf.chart(sym + ".IS", { period1: oneYearAgo, interval: "1d" }),
         yf.quoteSummary(sym + ".IS", {
-          modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents", "recommendationTrend"],
+          modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents", "recommendationTrend", "earnings"],
         }).catch(() => null),
       ]);
       const rows = (ch.quotes || []).filter((r) => r.close != null);
@@ -669,6 +698,7 @@ async function buildExtended(coreSymbols) {
           tgtHigh: round(fd.targetHighPrice, 2),
           analysts: fd.numberOfAnalystOpinions != null ? Math.round(fd.numberOfAnalystOpinions) : null,
           ...recTrend(qs),
+          ...financials(qs, fd),
         };
 
         // Dividend / earnings for the modal's stat tiles + timeline. The core
@@ -757,6 +787,7 @@ async function main() {
   const pivotsOut = {};
   const history = {};
   const fundamentals = {};
+  const prevFundamentals = await readJson("fundamentals.json", {});
   // Fixed early start so the chart archive GROWS over time (≈5y today → ≈10y by 2031).
   // Older-than-1y bars are downsampled to weekly to keep history.json small.
   const HISTORY_START = "2021-01-01";
@@ -771,7 +802,7 @@ async function main() {
       const [ch, qs] = await Promise.all([
         yf.chart(sym + ".IS", { period1: start, interval: "1d" }),
         yf.quoteSummary(sym + ".IS", {
-          modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents", "recommendationTrend"],
+          modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents", "recommendationTrend", "earnings"],
         }).catch(() => null),
       ]);
       if (qs) {
@@ -796,6 +827,7 @@ async function main() {
           tgtHigh: round(fd.targetHighPrice, 2),
           analysts: fd.numberOfAnalystOpinions != null ? Math.round(fd.numberOfAnalystOpinions) : null,
           ...recTrend(qs),
+          ...financials(qs, fd),
         };
 
         // Enrich details.json (dividend / EPS / earnings) — preserve timeline + name.
@@ -938,7 +970,10 @@ async function main() {
   await fs.writeFile(path.join(DATA_DIR, "technicals.json"), JSON.stringify(technicals));
   await fs.writeFile(path.join(DATA_DIR, "pivots.json"), JSON.stringify(pivotsOut));
   await fs.writeFile(path.join(DATA_DIR, "history.json"), JSON.stringify(history));
-  await fs.writeFile(path.join(DATA_DIR, "fundamentals.json"), JSON.stringify(fundamentals));
+  // Merge: a symbol Yahoo didn't return this run keeps its previous entry rather
+  // than disappearing from the app (fundamentals write used to fully overwrite).
+  const mergedFund = { ...prevFundamentals, ...fundamentals };
+  await fs.writeFile(path.join(DATA_DIR, "fundamentals.json"), JSON.stringify(mergedFund));
   if (universe) await fs.writeFile(path.join(DATA_DIR, "universe.json"), JSON.stringify(universe));
   // Extended files are only rewritten on a FULL run — a fast run must never
   // blank them out.
