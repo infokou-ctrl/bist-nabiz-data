@@ -405,6 +405,48 @@ async function fetchMarketNews(stocks, prev) {
   return { updatedAt: new Date().toISOString(), items: out };
 }
 
+// ---- commodity news (Google News RSS, per metal) -------------------------
+// The metals section deserves the same "what's moving it" feed the stocks have.
+// One precise Turkish query per commodity; deduped, most-recent first. Runs on
+// the same hourly gate as market news to keep Google requests modest.
+const COMMODITY_NEWS_Q = {
+  "gram-altin":    '("gram altın" OR "altın fiyat" OR "ons altın") (TL OR dolar OR fiyat)',
+  "gram-gumus":    '("gümüş fiyat" OR "gram gümüş" OR "ons gümüş")',
+  "gram-platin":   '("platin fiyat" OR platinyum) (metal OR ons OR fiyat)',
+  "gram-paladyum": '("paladyum fiyat" OR palladium) (metal OR ons OR fiyat)',
+  "kg-bakir":      '("bakır fiyat" OR "bakır ton" OR "London Metal Exchange bakır" OR "copper price")',
+};
+async function fetchCommodityNews(prev) {
+  const force = process.env.FORCE_NEWS === "1";
+  if (!force && new Date().getUTCMinutes() >= 15) {
+    return { updatedAt: (prev && prev.updatedAt) || null, items: (prev && prev.items) || {}, skipped: true };
+  }
+  const out = {};
+  for (const [sym, q] of Object.entries(COMMODITY_NEWS_Q)) {
+    const url = "https://news.google.com/rss/search?q=" + encodeURIComponent(q + " when:14d") + "&hl=tr&gl=TR&ceid=TR:tr";
+    try {
+      const ctrl = AbortSignal.timeout ? AbortSignal.timeout(9000) : undefined;
+      const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: ctrl });
+      if (!r.ok) { out[sym] = (prev && prev.items && prev.items[sym]) || []; continue; }
+      const items = parseRssItems(await r.text());
+      const seen = new Set();
+      const list = [];
+      for (const it of items) {
+        const k = (it.title || "").toLowerCase();
+        if (!k || seen.has(k)) continue;
+        seen.add(k);
+        list.push(it);
+      }
+      list.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+      out[sym] = list.slice(0, 15);
+    } catch {
+      out[sym] = (prev && prev.items && prev.items[sym]) || [];
+    }
+    await new Promise((res) => setTimeout(res, 150));
+  }
+  return { updatedAt: new Date().toISOString(), items: out };
+}
+
 // Quarterly + yearly revenue / net income / margins — the numbers a real
 // financial page leads with. Yahoo's earnings.financialsChart is the reliable
 // source (the raw incomeStatement submodules went empty in 2024).
@@ -484,6 +526,19 @@ async function fetchIndexHistory(startDate) {
   return out;
 }
 
+// ---- commodities (precious + industrial metals) --------------------------
+// Each metal's price in TRY per its natural retail unit. Precious metals trade
+// per troy ounce (31.1035 g) and are bought as GRAMS in Turkey; copper trades
+// per pound (453.592 g) and is quoted per KG. Stored value = USD price × USDTRY
+// / grams-per-unit × scale, so gram gold is ₺/gr and copper is ₺/kg.
+const COMMODITIES = [
+  { symbol: "gram-altin",    key: "XAU", label: "Gram Altın",    yh: "GC=F", grams: 31.1034768, scale: 1,    dec: 2 },
+  { symbol: "gram-gumus",    key: "XAG", label: "Gram Gümüş",    yh: "SI=F", grams: 31.1034768, scale: 1,    dec: 2 },
+  { symbol: "gram-platin",   key: "XPT", label: "Gram Platin",   yh: "PL=F", grams: 31.1034768, scale: 1,    dec: 2 },
+  { symbol: "gram-paladyum", key: "XPD", label: "Gram Paladyum", yh: "PA=F", grams: 31.1034768, scale: 1,    dec: 2 },
+  { symbol: "kg-bakir",      key: "XCU", label: "Kg Bakır",      yh: "HG=F", grams: 453.59237,  scale: 1000, dec: 2 },
+];
+
 // ---- FX history ----------------------------------------------------------
 // Daily closes for the currencies a BIST investor actually measures against.
 // Needed because "what did this stock do in dollars" cannot be answered with
@@ -510,19 +565,22 @@ async function fetchFxHistory(startDate) {
     if (eur) out.EUR = { d: eur.d, c: eur.c.map((v) => round(v, 4)) };
     if (gbp) out.GBP = { d: gbp.d, c: gbp.c.map((v) => round(v, 4)) };
 
-    // Gram gold in TRY = (gold USD/oz on that day) × (USDTRY that day) / 31.1034768
-    try {
-      const gold = await series("GC=F");
-      const usdBy = new Map(usd.d.map((d, i) => [d, usd.c[i]]));
-      const d = [], c = [];
-      for (let i = 0; i < gold.d.length; i++) {
-        const rate = usdBy.get(gold.d[i]);
-        if (rate == null) continue; // no FX print that day — skip rather than guess
-        d.push(gold.d[i]);
-        c.push(round((gold.c[i] * rate) / 31.1034768, 2));
-      }
-      if (d.length > 30) out.XAU = { d, c };
-    } catch { /* gold history optional */ }
+    // Commodity metals in TRY per retail unit. Each day divided by ITS OWN USD
+    // rate (no look-ahead), skipping days with no FX print rather than guessing.
+    const usdBy = new Map(usd.d.map((d, i) => [d, usd.c[i]]));
+    for (const m of COMMODITIES) {
+      try {
+        const s = await series(m.yh);
+        const d = [], c = [];
+        for (let i = 0; i < s.d.length; i++) {
+          const rate = usdBy.get(s.d[i]);
+          if (rate == null) continue;
+          d.push(s.d[i]);
+          c.push(round((s.c[i] * rate * m.scale) / m.grams, m.dec));
+        }
+        if (d.length > 30) out[m.key] = { d, c };
+      } catch { /* this metal's history optional */ }
+    }
   } catch (e) {
     console.log("  FX geçmişi alınamadı: " + e.message);
     return null;
@@ -545,17 +603,19 @@ async function fetchMarkets(prevMarkets) {
       fx.push({ symbol: sym, label, value: null, change: null });
     }
   }
-  // gram altın ≈ (gold USD/oz) × USDTRY / 31.1034768
-  try {
-    const g = await yf.quote("GC=F");
-    if (g.regularMarketPrice && usdtry) {
-      fx.push({
-        symbol: "gram-altin", label: "Gram Altın",
-        value: round((g.regularMarketPrice * usdtry) / 31.1034768, 2),
-        change: round(g.regularMarketChangePercent, 2),
-      });
-    }
-  } catch { /* skip gold */ }
+  // Commodity metals: current TRY per retail unit (see COMMODITIES).
+  for (const m of COMMODITIES) {
+    try {
+      const g = await yf.quote(m.yh);
+      if (g.regularMarketPrice && usdtry) {
+        fx.push({
+          symbol: m.symbol, label: m.label,
+          value: round((g.regularMarketPrice * usdtry * m.scale) / m.grams, m.dec),
+          change: round(g.regularMarketChangePercent, 2),
+        });
+      }
+    } catch { /* skip this metal */ }
+  }
   // inflation: preserve previous (Yahoo doesn't provide TR CPI)
   const inflation = (prevMarkets && prevMarkets.inflation) || null;
   return { fx, inflation };
@@ -946,6 +1006,12 @@ async function main() {
   const marketNews = await fetchMarketNews(stocks, prevMarketNews);
   if (marketNews.skipped) console.log("  (market news atlandı — saat başı çalışır)");
 
+  // 3c1) Commodity news (gold/silver/platinum/palladium/copper), same hourly gate.
+  console.log("Fetching commodity news…");
+  const prevCommodityNews = await readJson("commodityNews.json", { updatedAt: null, items: {} });
+  const commodityNews = await fetchCommodityNews(prevCommodityNews);
+  if (commodityNews.skipped) console.log("  (emtia haberi atlandı — saat başı çalışır)");
+
   // 3c2) Extended tier for every non-core symbol (FULL=1 / --full only).
   const wantFull = process.env.FULL === "1" || process.argv.includes("--full");
   let extended = null;
@@ -1002,6 +1068,8 @@ async function main() {
   const mnItems = marketNews.items || {};
   await fs.writeFile(path.join(DATA_DIR, "marketNews.json"), JSON.stringify({ updatedAt: marketNews.updatedAt, items: mnItems }));
   const mnCount = Object.values(mnItems).filter((a) => a && a.length).length;
+  const cnItems = commodityNews.items || {};
+  await fs.writeFile(path.join(DATA_DIR, "commodityNews.json"), JSON.stringify({ updatedAt: commodityNews.updatedAt, items: cnItems }));
 
   console.log(
     "Wrote (cloud/yahoo):\n  stocks " + stocks.length + " · technicals " + Object.keys(technicals).length +
