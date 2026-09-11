@@ -343,6 +343,26 @@ function makeRelevance(stock) {
   };
 }
 
+// Content-free / mirror headlines add noise, not signal. KAP mirror posts
+// ("KAP *** X A.Ş. *** SYM *** ...") duplicate the official KAP feed shown right
+// above; aggregator stubs ("... - KAP Haberleri - 2026-09-10 tarihli") say
+// nothing. Drop both from the PRESS feed.
+function isJunkNews(title) {
+  const t = String(title || "").trim();
+  if (!t) return true;
+  if (/\bKAP\b\s*\*\*\*/i.test(t)) return true;
+  if (/KAP\s*Haberleri/i.test(t)) return true;
+  if (/tarihli\s*$/i.test(t)) return true;
+  if (/^\s*\*{2,}/.test(t)) return true;
+  return false;
+}
+function cleanMarketTitle(title) {
+  return String(title || "")
+    .replace(/\s*\*{2,}\s*/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 async function fetchMarketNews(stocks, prev) {
   const prevItems = (prev && prev.items) || {};
   // Gate: only run when the CI wall-clock is in the first quarter-hour (≈ hourly),
@@ -361,7 +381,8 @@ async function fetchMarketNews(stocks, prev) {
   for (const [sym, items] of Object.entries(prevItems)) {
     const rel = relevanceBySym[sym];
     if (!rel) { out[sym] = items.slice(); continue; }
-    out[sym] = items.filter((n) => rel(n.title || ""));
+    out[sym] = items.filter((n) => rel(n.title || "") && !isJunkNews(n.title || ""))
+      .map((n) => ({ ...n, title: cleanMarketTitle(n.title || "") }));
     purged += items.length - out[sym].length;
   }
   if (purged) console.log("  arşivden elenen alakasız haber: " + purged);
@@ -391,6 +412,8 @@ async function fetchMarketNews(stocks, prev) {
       (seen[s.symbol] ||= new Set());
       for (const it of items) {
         if (!relevant(it.title || "")) continue; // company-specific only
+        if (isJunkNews(it.title)) continue;      // drop KAP mirrors / stubs
+        it.title = cleanMarketTitle(it.title);
         const key = (it.title || "").toLowerCase();
         if (!key || seen[s.symbol].has(key)) continue;
         seen[s.symbol].add(key);
