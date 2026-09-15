@@ -129,7 +129,14 @@ const SECTOR_TR = {
   "Energy": "Enerji", "Basic Materials": "Temel Malzeme", "Healthcare": "Sağlık",
   "Utilities": "Kamu Hizmetleri", "Real Estate": "Gayrimenkul", "Communication Services": "İletişim",
 };
-function mapSector(s) {
+// Per-symbol overrides: Yahoo files the listed football clubs under
+// "Communication Services" (media/broadcast revenue), which reads wrong on the
+// panel — they are sports clubs. Force them into a dedicated "Spor" sector.
+const SECTOR_SYMBOL = {
+  "GSRAY": "Spor", "FENER": "Spor", "BJKAS": "Spor", "TSPOR": "Spor",
+};
+function mapSector(s, sym) {
+  if (sym && SECTOR_SYMBOL[sym]) return SECTOR_SYMBOL[sym];
   return s ? (SECTOR_TR[s] || s) : null;
 }
 
@@ -765,7 +772,7 @@ async function buildExtended(coreSymbols) {
         const sd = qs.summaryDetail || {}, ks = qs.defaultKeyStatistics || {};
         const fd = qs.financialData || {}, ap = qs.assetProfile || {};
         fundamentals[sym] = {
-          sector: mapSector(ap.sector),
+          sector: mapSector(ap.sector, sym),
           marketCap: sd.marketCap != null ? Math.round(sd.marketCap) : null,
           pe: round(sd.trailingPE, 2),
           pb: round(ks.priceToBook, 2),
@@ -894,7 +901,7 @@ async function main() {
         const fd = qs.financialData || {};
         const ap = qs.assetProfile || {};
         fundamentals[sym] = {
-          sector: mapSector(ap.sector),
+          sector: mapSector(ap.sector, sym),
           marketCap: sd.marketCap != null ? Math.round(sd.marketCap) : null,
           pe: round(sd.trailingPE, 2),
           pb: round(ks.priceToBook, 2),
