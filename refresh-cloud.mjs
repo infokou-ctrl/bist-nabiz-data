@@ -246,7 +246,10 @@ async function fetchNews(symbols, prevNews) {
       (seen[code] ||= new Set());
       if (url && seen[code].has(url)) continue; // already archived
       if (url) seen[code].add(url);
-      out[code].push({ title, date, url });
+      // Keep the official KAP summary separately (clean disclosure text) so the
+      // in-app news view can show a real paragraph, not just the headline.
+      const sum = summary && summary.toLowerCase() !== subject.toLowerCase() ? summary : "";
+      out[code].push({ title, date, url, summary: sum || null });
     }
   }
 
@@ -290,11 +293,20 @@ function parseRssItems(xml) {
     const pub = pick("pubDate");
     // Google News titles are "Headline - Source"; drop the trailing source.
     if (source && title.endsWith(" - " + source)) title = title.slice(0, -(source.length + 3)).trim();
+    // Description → a plain-text snippet (strip HTML). Google News search feeds
+    // often put only related links here, so keep it only when it's real prose
+    // that isn't just the headline again.
+    const descRaw = pick("description");
+    let summary = descRaw
+      ? descRaw.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim()
+      : "";
+    if (summary && (summary.length < 40 || summary.toLowerCase() === title.toLowerCase())) summary = "";
+    if (summary.length > 500) summary = summary.slice(0, 497).trim() + "…";
     // Keep the full publish timestamp (ISO) so the UI can show the news TIME.
     let date = null;
     if (pub) { const d = new Date(pub); if (!isNaN(d.getTime())) date = d.toISOString(); }
     if (!title || title === "Google Haberler" || !link) continue;
-    items.push({ title, date, url: link, source: source || null });
+    items.push({ title, date, url: link, source: source || null, summary: summary || null });
   }
   return items;
 }
