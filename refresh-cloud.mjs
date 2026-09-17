@@ -447,6 +447,97 @@ async function fetchMarketNews(stocks, prev) {
   return { updatedAt: new Date().toISOString(), items: out };
 }
 
+// ---- article fetch + extractive summariser -------------------------------
+//
+// For each news item that still lacks a summary, fetch the article and pull its
+// opening paragraphs AS WRITTEN — a real, non-fabricated lede. No LLM, no key.
+// The Google News RSS link is a redirect; fetch() follows it to the publisher.
+// Best-effort: paywalls / bot walls / JS-only pages simply yield nothing and are
+// skipped, so an item without a summary just falls back to related headlines.
+const SUMMARY_MAX_PER_RUN = 30;   // keep CI fast and requests modest
+const SUMMARY_CONCURRENCY = 4;
+const SUMMARY_TIMEOUT_MS = 9000;
+const SUMMARY_MAX_CHARS = 620;
+
+function extractParagraphs(html) {
+  let h = String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
+  const art = h.match(/<article[\s\S]*?<\/article>/i);
+  const scope = art ? art[0] : h;
+  // Boilerplate a <p> scrape picks up on JS-rendered shells (Google News, KAP
+  // SPA, generic nav/consent). If we can't get REAL prose we return nothing — the
+  // app then shows related headlines rather than junk. Never ship boilerplate.
+  const JUNK = /tüm kategoriler|aşağıdaki öneriler|özel durum açıklaması\s+finansal rapor|fon bildirimleri|çerez|cookie|abone ol|reklam|tüm hakları|giriş yap|kayıt ol|menü|javascript|tarayıcınız/i;
+  const ps = [];
+  for (const m of scope.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)) {
+    const t = decodeEntities(m[1].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+    if (t.length < 60 || !/[.!?…]/.test(t) || JUNK.test(t)) continue;
+    // Prose has plenty of lowercase; a run of Capitalised category labels does not.
+    const lower = (t.match(/[a-zçğıöşü]/g) || []).length;
+    if (lower / t.length < 0.5) continue;
+    ps.push(t);
+  }
+  return ps;
+}
+
+function summariseParagraphs(ps) {
+  let out = "";
+  for (const p of ps) {
+    if (out && (out.length + 2 + p.length) > SUMMARY_MAX_CHARS) break;
+    out = out ? out + "\n\n" + p : p;
+    if (out.length >= SUMMARY_MAX_CHARS) break;
+  }
+  if (out.length > SUMMARY_MAX_CHARS) out = out.slice(0, SUMMARY_MAX_CHARS - 1).trim() + "…";
+  return out.trim();
+}
+
+async function fetchArticleSummary(url) {
+  try {
+    // Google News RSS links are opaque redirect shells that don't resolve to the
+    // publisher server-side (they need a fragile, rate-limited Google endpoint),
+    // so never spend a request on them — the app falls back to related headlines.
+    const host = (() => { try { return new URL(url).hostname; } catch { return ""; } })();
+    if (/(^|\.)news\.google\.com$/.test(host) || /(^|\.)google\.com$/.test(host)) return null;
+    const signal = AbortSignal.timeout ? AbortSignal.timeout(SUMMARY_TIMEOUT_MS) : undefined;
+    const r = await fetch(url, {
+      redirect: "follow",
+      headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36", "Accept-Language": "tr,en;q=0.8" },
+      signal,
+    });
+    if (!r.ok) return null;
+    const ct = r.headers.get("content-type") || "";
+    if (!/text\/html/i.test(ct)) return null;
+    const html = await r.text();
+    const sum = summariseParagraphs(extractParagraphs(html));
+    return sum && sum.length >= 80 ? sum : null;
+  } catch {
+    return null;
+  }
+}
+
+// Enrich a {sym: items[]} map in place: fill missing summaries, newest first,
+// capped per run. Items keep any summary they already have (cache).
+async function enrichSummaries(itemsBySym, cap = SUMMARY_MAX_PER_RUN) {
+  const pending = [];
+  for (const sym of Object.keys(itemsBySym || {})) {
+    for (const it of itemsBySym[sym] || []) {
+      if (it && it.url && !it.summary) pending.push(it);
+    }
+  }
+  pending.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+  const batch = pending.slice(0, cap);
+  if (!batch.length) return 0;
+  let filled = 0;
+  await mapLimit(batch, SUMMARY_CONCURRENCY, async (it) => {
+    const s = await fetchArticleSummary(it.url);
+    if (s) { it.summary = s; filled++; }
+    else if (it.summary === undefined) it.summary = null;
+  });
+  return filled;
+}
+
 // ---- commodity news (Google News RSS, per metal) -------------------------
 // The metals section deserves the same "what's moving it" feed the stocks have.
 // One precise Turkish query per commodity; deduped, most-recent first. Runs on
@@ -1047,6 +1138,18 @@ async function main() {
   const prevMarketNews = await readJson("marketNews.json", { updatedAt: null, items: {} });
   const marketNews = await fetchMarketNews(stocks, prevMarketNews);
   if (marketNews.skipped) console.log("  (market news atlandı — saat başı çalışır)");
+  // 3c0) Article summaries — fetch the piece and keep its opening paragraphs
+  // (real lede, no LLM, no fabrication). Only for items with a DIRECTLY fetchable
+  // URL still missing a summary (KAP disclosures + any direct press link); Google
+  // News redirect shells are skipped, so those keep the related-headlines fallback.
+  if (news && news !== prevNews) {
+    process.stdout.write("KAP özetleri çekiliyor… ");
+    console.log((await enrichSummaries(news)) + " eklendi");
+  }
+  if (!marketNews.skipped) {
+    process.stdout.write("Haber özetleri çekiliyor… ");
+    console.log((await enrichSummaries(marketNews.items)) + " eklendi");
+  }
 
   // 3c1) Commodity news (gold/silver/platinum/palladium/copper), same hourly gate.
   console.log("Fetching commodity news…");
