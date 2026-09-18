@@ -10,6 +10,7 @@ import YahooFinance from "yahoo-finance2";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { checkFundamentals } from "./lib/quality.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
@@ -893,6 +894,7 @@ async function buildExtended(coreSymbols) {
           ...recTrend(qs),
           ...financials(qs, fd),
         };
+        { const _dq = checkFundamentals(fundamentals[sym]); if (_dq) fundamentals[sym].dq = _dq; }
 
         // Dividend / earnings for the modal's stat tiles + timeline. The core
         // 100 gets a richer, Borsa_MCP-seeded timeline; here we can only build
@@ -1083,6 +1085,7 @@ async function main() {
           ...recTrend(qs),
           ...financials(qs, fd),
         };
+        { const _dq = checkFundamentals(fundamentals[sym]); if (_dq) fundamentals[sym].dq = _dq; }
 
         // Enrich details.json (dividend / EPS / earnings) — preserve timeline + name.
         const ce = qs.calendarEvents || {};
