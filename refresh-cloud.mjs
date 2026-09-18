@@ -948,6 +948,59 @@ async function buildExtended(coreSymbols) {
 }
 
 // ---- main ----------------------------------------------------------------
+// ---- fast intraday snapshot ---------------------------------------------
+// One batched Yahoo quote for all core symbols → data/intraday.json.
+// The app merges this over stocks.json for ~1-2 min fresh prices, and each
+// quote carries a `quality` flag (ok | stale | missing) so the UI can be honest.
+async function refreshIntraday(symbols) {
+  const yhSymbols = symbols.map((s) => s + ".IS");
+  const quotes = {};
+  // Batch in chunks to stay under Yahoo's per-request limits.
+  for (let i = 0; i < yhSymbols.length; i += 200) {
+    const part = yhSymbols.slice(i, i + 200);
+    try {
+      const arr = await yf.quote(part);
+      for (const q of Array.isArray(arr) ? arr : [arr]) {
+        quotes[(q.symbol || "").replace(".IS", "")] = q;
+      }
+    } catch (e) {
+      console.log("  intraday batch failed (" + e.message + ")");
+    }
+  }
+
+  const nowMs = Date.now();
+  const STALE_MS = 6 * 60_000; // >6 min old → mark stale, don't hide
+  const out = {};
+  let ok = 0, stale = 0, missing = 0;
+  for (const sym of symbols) {
+    const q = quotes[sym];
+    const last = q?.regularMarketPrice;
+    if (q == null || last == null || !isFinite(last)) { missing++; continue; }
+    const tSec = q.regularMarketTime instanceof Date
+      ? q.regularMarketTime.getTime() / 1000
+      : (typeof q.regularMarketTime === "number" ? q.regularMarketTime : null);
+    const tISO = tSec ? new Date(tSec * 1000).toISOString() : null;
+    const quality = (tSec && nowMs - tSec * 1000 > STALE_MS) ? "stale" : "ok";
+    quality === "stale" ? stale++ : ok++;
+    out[sym] = {
+      last: round(last, 2),
+      chg: round(q.regularMarketChangePercent, 2),
+      vol: q.regularMarketVolume ?? null,
+      t: tISO,
+      quality,
+    };
+  }
+
+  const payload = {
+    updatedAt: new Date().toISOString(),
+    source: "yahoo-quote",
+    counts: { ok, stale, missing, total: symbols.length },
+    quotes: out,
+  };
+  await fs.writeFile(path.join(DATA_DIR, "intraday.json"), JSON.stringify(payload));
+  console.log(`intraday.json yazıldı — ok:${ok} stale:${stale} missing:${missing}`);
+}
+
 async function main() {
   const prevStocks = await readJson("stocks.json", { stocks: [], macro: [] });
   const prevMarkets = await readJson("markets.json", null);
@@ -958,6 +1011,14 @@ async function main() {
   for (const s of prevStocks.stocks || []) nameMap[s.symbol] = s.name;
   const symbols = (prevStocks.stocks || []).map((s) => s.symbol);
   if (!symbols.length) throw new Error("stocks.json boş — sembol listesi yok.");
+
+  // --- Fast intraday-only path (called by refresh-fast.yml every ~2 min) -----
+  // Only a batched quote → intraday.json. Skips the slow 1y chart/quoteSummary
+  // loop entirely, so it never touches history/fundamentals/news files.
+  if (process.env.INTRADAY === "1" || process.argv.includes("--intraday-only")) {
+    await refreshIntraday(symbols);
+    return;
+  }
 
   const todayStr = new Date().toISOString().slice(0, 10);
 

@@ -1,0 +1,56 @@
+name: Refresh fast (intraday)
+
+# Sadece intraday.json'u tazeler — tek batched Yahoo quote, ~1-2 dk taze fiyat.
+# Ağır 1y chart/temel/haber döngüsüne DOKUNMAZ; yalnızca data/intraday.json yazar.
+# Uygulama bunu stocks.json üstüne merge eder (bkz. src/data.ts).
+
+on:
+  schedule:
+    # Her 2 dk, hafta içi, ~10:00–18:55 TSİ (07:00–15:55 UTC). Public repo = sınırsız.
+    - cron: "*/2 7-15 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# refresh.yml ile AYNI grup: aynı anda data/ yazmazlar (rebase çakışması olmaz).
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Duraklatma kilidi
+        id: guard
+        run: |
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ -f data/PAUSE ]; then
+            echo "paused=true" >> "$GITHUB_OUTPUT"
+            echo "⏸  data/PAUSE var — otomatik koşu atlandı."
+          else
+            echo "paused=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.paused == 'false'
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+        if: steps.guard.outputs.paused == 'false'
+      - run: node refresh-cloud.mjs --intraday-only
+        if: steps.guard.outputs.paused == 'false'
+        continue-on-error: true
+      - name: Commit intraday
+        if: steps.guard.outputs.paused == 'false'
+        run: |
+          git config user.name "bist-nabiz-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/intraday.json
+          if git diff --cached --quiet; then
+            echo "intraday değişmedi — commit yok."
+          else
+            git commit -m "intraday: fiyat tazeleme ($(date -u +%Y-%m-%dT%H:%MZ))"
+            git pull --rebase --autostash origin main || true
+            git push
+          fi
