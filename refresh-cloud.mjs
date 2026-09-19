@@ -11,6 +11,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkFundamentals } from "./lib/quality.mjs";
+import { evdsSeries, EVDS_CODES, yoyPct } from "./lib/evds.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
@@ -1039,6 +1040,52 @@ async function refreshNewsOnly(prevStocks) {
   console.log(`news-only yazıldı — KAP:${Object.keys(news).length} · piyasa:${mn}${marketNews.skipped ? " (piyasa/emtia saat kapısında atlandı)" : ""}`);
 }
 
+// ---- macro-only refresh (EVDS) -------------------------------------------
+const TR_MONTHS = ["Oca","Şub","Mar","Nis","May","Haz","Tem","Ağu","Eyl","Eki","Kas","Ara"];
+function trMonthLabel(iso) {
+  const m = /^(\d{4})-(\d{2})/.exec(iso);
+  if (!m) return null;
+  return TR_MONTHS[Number(m[2]) - 1] + " " + m[1];
+}
+const pctStr = (v) => (v == null ? null : "%" + v.toFixed(2).replace(".", ","));
+
+async function refreshMacroOnly(prevStocks) {
+  const key = process.env.EVDS_KEY || "";
+  if (!key) { console.log("EVDS_KEY yok — makro güncelleme atlandı."); return; }
+
+  // 1) CPI monthly index since 2021 → cpiHistory.json (the durable artifact).
+  const cpi = await evdsSeries(key, EVDS_CODES.cpi, "01-01-2021");
+  if (cpi.length) {
+    const d = cpi.map((x) => x.date), c = cpi.map((x) => round(x.value, 2));
+    await fs.writeFile(path.join(DATA_DIR, "cpiHistory.json"), JSON.stringify({ code: EVDS_CODES.cpi, source: "EVDS", updatedAt: new Date().toISOString(), d, c }));
+    console.log(`cpiHistory.json yazıldı — ${cpi.length} ay (son: ${d[d.length - 1]})`);
+  } else {
+    console.log("EVDS CPI boş — cpiHistory yazılmadı.");
+  }
+
+  // 2) Patch the CPI rows in stocks.json.macro from the same series.
+  const macro = Array.isArray(prevStocks.macro) ? prevStocks.macro.slice() : [];
+  if (cpi.length >= 13) {
+    const last = cpi[cpi.length - 1], prev = cpi[cpi.length - 2];
+    const monthly = prev.value > 0 ? (last.value / prev.value - 1) * 100 : null;
+    const yearly = yoyPct(cpi);
+    const label = trMonthLabel(last.date);
+    for (const row of macro) {
+      if (/Enflasyon Oranı \(Aylık\)/i.test(row.event) && monthly != null) {
+        row.previous = row.actual ?? row.previous;
+        row.actual = pctStr(monthly); row.status = "released"; if (label) row.date = label;
+      }
+      if (/Enflasyon Oranı \(Yıllık\)/i.test(row.event) && yearly != null) {
+        row.previous = row.actual ?? row.previous;
+        row.actual = pctStr(yearly); row.status = "released"; if (label) row.date = label;
+      }
+    }
+    const out = { ...prevStocks, macro };
+    await fs.writeFile(path.join(DATA_DIR, "stocks.json"), JSON.stringify(out));
+    console.log(`macro güncellendi — TÜFE aylık ${pctStr(monthly)} · yıllık ${pctStr(yearly)}`);
+  }
+}
+
 async function main() {
   const prevStocks = await readJson("stocks.json", { stocks: [], macro: [] });
   const prevMarkets = await readJson("markets.json", null);
@@ -1064,6 +1111,16 @@ async function main() {
   // reader still gets fresh headlines, without touching prices/history/fundamentals.
   if (process.env.NEWS_ONLY === "1" || process.argv.includes("--news-only")) {
     await refreshNewsOnly(prevStocks);
+    return;
+  }
+
+  // --- Macro-only path (EVDS): real CPI series + inflation figures ------------
+  // Needs EVDS_KEY. Builds cpiHistory.json (monthly TÜFE index, 2021→) which
+  // unlocks inflation-adjusted real return in the app, and refreshes the CPI
+  // rows in stocks.json.macro. Other series stay on seed until their codes are
+  // verified (a wrong code yields nothing and is skipped — never fabricated).
+  if (process.env.MACRO_ONLY === "1" || process.argv.includes("--macro-only")) {
+    await refreshMacroOnly(prevStocks);
     return;
   }
 

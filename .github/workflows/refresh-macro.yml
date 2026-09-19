@@ -1,0 +1,56 @@
+name: Refresh macro (EVDS)
+
+# TCMB EVDS'ten gerçek makro: TÜFE aylık endeks → cpiHistory.json (enflasyon
+# düzeltmeli reel getiriyi açar) + stocks.json'daki enflasyon satırları.
+# EVDS_KEY repo secret'ı GEREKİR (yoksa adım kendini atlar, hata vermez).
+# Aylık veri → günde bir koşu yeterli.
+
+on:
+  schedule:
+    - cron: "20 6 * * *"   # her gün 06:20 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  macro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Duraklatma kilidi
+        id: guard
+        run: |
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ -f data/PAUSE ]; then
+            echo "paused=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "paused=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.paused == 'false'
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+        if: steps.guard.outputs.paused == 'false'
+      - run: node refresh-cloud.mjs --macro-only
+        if: steps.guard.outputs.paused == 'false'
+        continue-on-error: true
+        env:
+          EVDS_KEY: ${{ secrets.EVDS_KEY }}
+      - name: Commit macro
+        if: steps.guard.outputs.paused == 'false'
+        run: |
+          git config user.name "bist-nabiz-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/cpiHistory.json data/stocks.json
+          if git diff --cached --quiet; then
+            echo "makro değişmedi — commit yok."
+          else
+            git commit -m "macro: EVDS TÜFE tazeleme ($(date -u +%Y-%m-%dT%H:%MZ))"
+            git pull --rebase --autostash origin main || true
+            git push
+          fi
