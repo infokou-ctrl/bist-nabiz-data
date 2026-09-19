@@ -1,0 +1,57 @@
+name: Refresh news (7/24)
+
+# Sadece haberleri tazeler (news.json / marketNews.json / commodityNews.json).
+# Fiyat/teknik/temel dosyalara DOKUNMAZ. Amaç: borsa kapalıyken de (hafta sonu
+# dahil) taze haber akışı — kullanıcı hafta sonu program kurabilsin.
+# Saat kapısı (dakika < 15) fetchMarketNews içinde; cron :05'te çalışır → geçer.
+
+on:
+  schedule:
+    # Her saatin 5. dakikası, 06:00–21:00 UTC (≈09:00–24:00 TSİ), HER GÜN (hafta sonu dahil).
+    - cron: "5 6-21 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# Diğer refresh akışlarıyla aynı grup: aynı anda data/ yazmazlar.
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  news:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Duraklatma kilidi
+        id: guard
+        run: |
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ -f data/PAUSE ]; then
+            echo "paused=true" >> "$GITHUB_OUTPUT"
+            echo "⏸  data/PAUSE var — otomatik koşu atlandı."
+          else
+            echo "paused=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.paused == 'false'
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+        if: steps.guard.outputs.paused == 'false'
+      - run: node refresh-cloud.mjs --news-only
+        if: steps.guard.outputs.paused == 'false'
+        continue-on-error: true
+      - name: Commit news
+        if: steps.guard.outputs.paused == 'false'
+        run: |
+          git config user.name "bist-nabiz-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/news.json data/marketNews.json data/commodityNews.json
+          if git diff --cached --quiet; then
+            echo "haber değişmedi — commit yok."
+          else
+            git commit -m "news: haber tazeleme ($(date -u +%Y-%m-%dT%H:%MZ))"
+            git pull --rebase --autostash origin main || true
+            git push
+          fi

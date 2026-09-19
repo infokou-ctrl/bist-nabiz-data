@@ -1003,6 +1003,42 @@ async function refreshIntraday(symbols) {
   console.log(`intraday.json yazıldı — ok:${ok} stale:${stale} missing:${missing}`);
 }
 
+// ---- news-only refresh (weekends included) -------------------------------
+// Writes news.json / marketNews.json / commodityNews.json only. Leaves every
+// price/technical/fundamental file untouched so a weekend run never regresses
+// stale market data over the last weekday close.
+async function refreshNewsOnly(prevStocks) {
+  const stocks = prevStocks.stocks || [];
+  const symbols = stocks.map((s) => s.symbol);
+
+  const prevNews = await readJson("news.json", {});
+  const uniSeedForNews = await readJson("universe-seed.json", []);
+  const newsSymbols = [...new Set([...symbols, ...uniSeedForNews.map((s) => s.symbol)])];
+  const news = await fetchNews(newsSymbols, prevNews);
+
+  const prevMarketNews = await readJson("marketNews.json", { updatedAt: null, items: {} });
+  const marketNews = await fetchMarketNews(stocks, prevMarketNews);
+
+  if (news && news !== prevNews) {
+    process.stdout.write("KAP özetleri çekiliyor… ");
+    console.log((await enrichSummaries(news)) + " eklendi");
+  }
+  if (!marketNews.skipped) {
+    process.stdout.write("Haber özetleri çekiliyor… ");
+    console.log((await enrichSummaries(marketNews.items)) + " eklendi");
+  }
+
+  const prevCommodityNews = await readJson("commodityNews.json", { updatedAt: null, items: {} });
+  const commodityNews = await fetchCommodityNews(prevCommodityNews);
+
+  if (news !== prevNews) await fs.writeFile(path.join(DATA_DIR, "news.json"), JSON.stringify(news));
+  await fs.writeFile(path.join(DATA_DIR, "marketNews.json"), JSON.stringify({ updatedAt: marketNews.updatedAt, items: marketNews.items || {} }));
+  await fs.writeFile(path.join(DATA_DIR, "commodityNews.json"), JSON.stringify({ updatedAt: commodityNews.updatedAt, items: commodityNews.items || {} }));
+
+  const mn = Object.values(marketNews.items || {}).filter((a) => a && a.length).length;
+  console.log(`news-only yazıldı — KAP:${Object.keys(news).length} · piyasa:${mn}${marketNews.skipped ? " (piyasa/emtia saat kapısında atlandı)" : ""}`);
+}
+
 async function main() {
   const prevStocks = await readJson("stocks.json", { stocks: [], macro: [] });
   const prevMarkets = await readJson("markets.json", null);
@@ -1019,6 +1055,15 @@ async function main() {
   // loop entirely, so it never touches history/fundamentals/news files.
   if (process.env.INTRADAY === "1" || process.argv.includes("--intraday-only")) {
     await refreshIntraday(symbols);
+    return;
+  }
+
+  // --- News-only path (refresh-news.yml, hourly incl. weekends) --------------
+  // Prices don't move when the market is closed, but the press and KAP keep
+  // publishing. This fetches only news/marketNews/commodityNews so a weekend
+  // reader still gets fresh headlines, without touching prices/history/fundamentals.
+  if (process.env.NEWS_ONLY === "1" || process.argv.includes("--news-only")) {
+    await refreshNewsOnly(prevStocks);
     return;
   }
 
