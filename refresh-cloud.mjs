@@ -11,7 +11,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkFundamentals } from "./lib/quality.mjs";
-import { evdsSeries, EVDS_CODES, yoyPct } from "./lib/evds.mjs";
+import { evdsSeries, EVDS_CODES, EVDS_MACRO_CANDIDATES, yoyPct } from "./lib/evds.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
@@ -1080,9 +1080,32 @@ async function refreshMacroOnly(prevStocks) {
         row.actual = pctStr(yearly); row.status = "released"; if (label) row.date = label;
       }
     }
+    console.log(`macro güncellendi — TÜFE aylık ${pctStr(monthly)} · yıllık ${pctStr(yearly)}`);
+  }
+
+  // 3) Candidate macro series (policy rate / unemployment / current account).
+  // Fetch latest, log, and accept ONLY when the value is in a sane range. A wrong
+  // code (empty) or a mislabelled-but-valid code (insane value) is rejected.
+  const key2 = process.env.EVDS_KEY;
+  for (const spec of EVDS_MACRO_CANDIDATES) {
+    const s = await evdsSeries(key2, spec.code, "01-01-2023");
+    if (!s.length) { console.log(`  [${spec.key}] ${spec.code}: veri yok → atlandı (kod yanlış olabilir, güven: ${spec.conf})`); continue; }
+    const last = s[s.length - 1];
+    const inRange = last.value >= spec.min && last.value <= spec.max;
+    console.log(`  [${spec.key}] ${spec.code}: son=${last.value} (${last.date}) — ${inRange ? "MAKUL ✓" : "ARALIK DIŞI ✗ reddedildi"}`);
+    if (!inRange) continue;
+    const val = spec.kind === "pct" ? pctStr(last.value)
+      : spec.kind === "bnusd" ? (last.value / 1000).toFixed(2).replace(".", ",") + " mlyr $"
+      : String(last.value);
+    const label = trMonthLabel(last.date) || last.date;
+    const row = macro.find((r) => r.event === spec.event);
+    if (row) { row.previous = row.actual ?? row.previous; row.actual = val; row.status = "released"; row.date = label; }
+    else macro.push({ event: spec.event, actual: val, previous: null, status: "released", date: label, note: "TCMB EVDS", schedule: "EVDS güncellemesine göre" });
+  }
+
+  if (cpi.length >= 13 || EVDS_MACRO_CANDIDATES.length) {
     const out = { ...prevStocks, macro };
     await fs.writeFile(path.join(DATA_DIR, "stocks.json"), JSON.stringify(out));
-    console.log(`macro güncellendi — TÜFE aylık ${pctStr(monthly)} · yıllık ${pctStr(yearly)}`);
   }
 }
 
