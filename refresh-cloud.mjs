@@ -874,7 +874,10 @@ async function buildExtended(coreSymbols) {
       }
 
       const dts = rows.map((r) => r.date.toISOString().slice(0, 10));
-      history[sym] = { s: dts[0], e: dts[dts.length - 1], d: dts, c: closes.map((c) => round(c, 2)) };
+      history[sym] = {
+        s: dts[0], e: dts[dts.length - 1], d: dts, c: closes.map((c) => round(c, 2)),
+        v: rows.map((r) => (r.volume != null ? Math.round(r.volume) : null)),
+      };
 
       if (qs) {
         const sd = qs.summaryDetail || {}, ks = qs.defaultKeyStatistics || {};
@@ -1288,6 +1291,7 @@ async function main() {
           s: dts[0], e: dts[dts.length - 1], d: dts,
           o: hrows.map((r) => round(r.open, 2)), h: hrows.map((r) => round(r.high, 2)),
           l: hrows.map((r) => round(r.low, 2)), c: hrows.map((r) => round(r.close, 2)),
+          v: hrows.map((r) => (r.volume != null ? Math.round(r.volume) : null)),
         };
       }
     } catch (e) {
