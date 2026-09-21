@@ -627,12 +627,15 @@ function recTrend(qs) {
 // ---- index history -------------------------------------------------------
 // The OFFICIAL Borsa İstanbul indices (free-float market-cap weighted) — a
 // different, more authoritative series than the app's own equal-weight average.
-// BIST 50 is intentionally omitted: Yahoo has no usable history for XU050 (one
-// day only), and a chart built from a single point would be a lie.
+// BIST 50 (XU050) is intentionally omitted: Yahoo still has only one day of
+// history for it, and a chart from a single point would be a lie. Banka (XBANK)
+// and Sanayi (XUSIN) do have full history, so they're included.
 async function fetchIndexHistory(startDate) {
   const defs = [
     { code: "XU100", yh: "XU100.IS", label: "BIST 100" },
     { code: "XU030", yh: "XU030.IS", label: "BIST 30" },
+    { code: "XBANK", yh: "XBANK.IS", label: "BIST Banka" },
+    { code: "XUSIN", yh: "XUSIN.IS", label: "BIST Sanayi" },
   ];
   const out = {};
   for (const d of defs) {
