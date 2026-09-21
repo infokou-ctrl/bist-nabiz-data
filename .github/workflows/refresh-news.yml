@@ -52,6 +52,10 @@ jobs:
             echo "haber değişmedi — commit yok."
           else
             git commit -m "news: haber tazeleme ($(date -u +%Y-%m-%dT%H:%MZ))"
-            git pull --rebase --autostash origin main || true
-            git push
+            for i in 1 2 3 4 5; do
+              if git pull --rebase --autostash origin main && git push; then exit 0; fi
+              git rebase --abort 2>/dev/null || true
+              echo "push denemesi $i basarisiz - tekrar deniyor..."; sleep $((RANDOM % 6 + 4))
+            done
+            echo "push 5 denemede basarisiz oldu"; exit 1
           fi
