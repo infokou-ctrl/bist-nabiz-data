@@ -51,10 +51,14 @@ jobs:
             echo "makro değişmedi — commit yok."
           else
             git commit -m "macro: EVDS TÜFE tazeleme ($(date -u +%Y-%m-%dT%H:%MZ))"
-            for i in 1 2 3 4 5; do
-              if git pull --rebase -X theirs --autostash origin main && git push; then exit 0; fi
-              git rebase --abort 2>/dev/null || true
-              echo "push denemesi $i basarisiz - tekrar deniyor..."; sleep $((RANDOM % 6 + 4))
+            for i in $(seq 1 10); do
+              git fetch --quiet origin main || { echo "fetch $i basarisiz"; sleep $((RANDOM % 10 + 6)); continue; }
+              if git rebase -X theirs origin/main; then
+                if git push origin HEAD:main; then echo "push tamam (deneme $i)"; exit 0; fi
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+              echo "push denemesi $i basarisiz - tekrar deniyor..."; sleep $((RANDOM % 10 + 6))
             done
-            echo "push 5 denemede basarisiz oldu"; exit 1
+            echo "push 10 denemede basarisiz oldu"; exit 1
           fi
