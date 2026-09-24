@@ -46,7 +46,10 @@ jobs:
         run: |
           git config user.name "bist-nabiz-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/cpiHistory.json data/stocks.json
+          # cpiHistory.json yalnizca EVDS_KEY varsa uretilir; yoksa dosya olusmaz.
+          # Olmayan dosyayi 'git add' etmek adimi comertir -> yalnizca var olani ekle.
+          git add data/stocks.json
+          [ -f data/cpiHistory.json ] && git add data/cpiHistory.json || true
           if git diff --cached --quiet; then
             echo "makro değişmedi — commit yok."
           else
