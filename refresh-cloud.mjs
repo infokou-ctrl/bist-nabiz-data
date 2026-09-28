@@ -1231,13 +1231,18 @@ async function main() {
           symbol: sym,
           name: prev.name || nameMap[sym] || q?.shortName || sym,
           annualDividend: sd.dividendRate != null ? round(sd.dividendRate, 4) : (prev.annualDividend ?? null),
-          nextDividend: prev.nextDividend ?? null,
+          // The seeded "next" dividend used to be carried forward forever, so it
+          // stayed "next" after its date passed (BIMAS: 16 Eylül shown as next on
+          // 28 Eylül). Keep it only while it's still ahead.
+          nextDividend: prev.nextDividend && prev.nextDividend.date >= today ? prev.nextDividend : null,
           lastDividend: lastDivDate && lastDivVal != null
             ? { date: lastDivDate, amount: lastDivVal }
             : (prev.lastDividend ?? null),
           nextEarningsDate: nextEarn || prev.nextEarningsDate || null,
           epsTtm: ks.trailingEps != null ? round(ks.trailingEps, 4) : (prev.epsTtm ?? null),
-          timeline: prev.timeline || [],
+          // Re-derive `future` from today on every run — the seed's flags were
+          // frozen, so past items stayed "ileri tarihli".
+          timeline: (prev.timeline || []).map((t) => ({ ...t, future: t.date >= today })),
         };
       }
       const rows = (ch.quotes || []).filter((r) => r.close != null);
