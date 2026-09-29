@@ -977,8 +977,17 @@ async function refreshIntraday(symbols) {
     }
   }
 
-  const nowMs = Date.now();
-  const STALE_MS = 6 * 60_000; // >6 min old → mark stale, don't hide
+  // Stale = this quote lags the FRESHEST quote of the batch by >6 min (the stock
+  // stopped trading: halt / illiquid). It used to be judged against the wall
+  // clock, but Yahoo's BIST feed is ~15 min delayed by itself, so every quote
+  // was "stale" all session long and the flag carried no information.
+  const STALE_MS = 6 * 60_000;
+  let freshestMs = 0;
+  for (const sym of symbols) {
+    const rt = quotes[sym]?.regularMarketTime;
+    const ms = rt instanceof Date ? rt.getTime() : (typeof rt === "number" ? rt * 1000 : NaN);
+    if (isFinite(ms) && ms > freshestMs) freshestMs = ms;
+  }
   const out = {};
   let ok = 0, stale = 0, missing = 0;
   for (const sym of symbols) {
@@ -989,7 +998,7 @@ async function refreshIntraday(symbols) {
       ? q.regularMarketTime.getTime() / 1000
       : (typeof q.regularMarketTime === "number" ? q.regularMarketTime : null);
     const tISO = tSec ? new Date(tSec * 1000).toISOString() : null;
-    const quality = (tSec && nowMs - tSec * 1000 > STALE_MS) ? "stale" : "ok";
+    const quality = (tSec && freshestMs && freshestMs - tSec * 1000 > STALE_MS) ? "stale" : "ok";
     quality === "stale" ? stale++ : ok++;
     out[sym] = {
       last: round(last, 2),
