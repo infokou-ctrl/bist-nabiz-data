@@ -278,8 +278,15 @@ function cleanCompanyName(name) {
 function decodeEntities(s) {
   return String(s)
     .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
+    .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&([a-z]+);/gi, (m, n) => NAMED_ENTITIES[n] ?? m);
 }
+// Named entities Turkish outlets actually emit in descriptions / paragraphs.
+const NAMED_ENTITIES = {
+  nbsp: " ", ccedil: "ç", Ccedil: "Ç", ouml: "ö", Ouml: "Ö", uuml: "ü", Uuml: "Ü",
+  rsquo: "’", lsquo: "‘", ldquo: "“", rdquo: "”", hellip: "…", ndash: "–", mdash: "—", laquo: "«", raquo: "»",
+};
 
 function parseRssItems(xml) {
   const items = [];
@@ -302,7 +309,7 @@ function parseRssItems(xml) {
     let summary = descRaw
       ? descRaw.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim()
       : "";
-    if (summary && (summary.length < 40 || summary.toLowerCase() === title.toLowerCase())) summary = "";
+    if (summary && (summary.length < 40 || isEchoSummary(summary, title, source))) summary = "";
     if (summary.length > 500) summary = summary.slice(0, 497).trim() + "…";
     // Keep the full publish timestamp (ISO) so the UI can show the news TIME.
     let date = null;
@@ -449,17 +456,46 @@ async function fetchMarketNews(stocks, prev) {
   return { updatedAt: new Date().toISOString(), items: out };
 }
 
-// ---- article fetch + extractive summariser -------------------------------
+// ---- article summary --------------------------------------------------------
 //
-// For each news item that still lacks a summary, fetch the article and pull its
-// opening paragraphs AS WRITTEN — a real, non-fabricated lede. No LLM, no key.
-// The Google News RSS link is a redirect; fetch() follows it to the publisher.
-// Best-effort: paywalls / bot walls / JS-only pages simply yield nothing and are
-// skipped, so an item without a summary just falls back to related headlines.
-const SUMMARY_MAX_PER_RUN = 30;   // keep CI fast and requests modest
+// For each news item without a real summary: resolve the Google News link to the
+// publisher's page, then take the PUBLISHER'S OWN short description of the story
+// (og:description / meta description — what the outlet wrote for link previews).
+// If that is missing or is the site's generic blurb, fall back to the article's
+// opening paragraphs as written. No LLM, no key, nothing invented; every summary
+// is the outlet's text, shown with its name and a link. Best-effort: bot walls /
+// paywalls / JS-only pages yield nothing and the app says "özet alınamadı".
+//
+// Measured 2026-10-01: all 1.211 archived items carried only "headline + source"
+// as their summary (Google's <description>), and the old code refused to follow
+// Google links — so the app never had a single real summary.
+const SUMMARY_MAX_PER_RUN = Number(process.env.SUMMARY_CAP) || 120; // CI: modest; local backfill sets SUMMARY_CAP
 const SUMMARY_CONCURRENCY = 4;
 const SUMMARY_TIMEOUT_MS = 9000;
-const SUMMARY_MAX_CHARS = 620;
+const SUMMARY_MAX_CHARS = 420;
+const SUMMARY_MAX_TRIES = 2;      // a page that failed twice is not retried every hour
+const BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36";
+
+const normText = (x) => String(x || "").toLocaleLowerCase("tr-TR").replace(/[^\p{L}\p{N} ]/gu, " ").replace(/\s+/g, " ").trim();
+
+// Google News puts "Headline  Source" into <description>. That is not a summary.
+function isEchoSummary(summary, title, source) {
+  let rest = normText(summary);
+  if (!rest) return true;
+  for (const part of [normText(title), normText(source)]) if (part) rest = rest.split(part).join(" ");
+  return rest.replace(/\s+/g, " ").trim().length < 25;
+}
+
+// Does this text talk about the same thing as the headline? Guards against a
+// site-wide blurb ("X Dergisi haberleri, tüm Türkiye'den…") or a scraped menu.
+function sharesTopic(text, title) {
+  const words = new Set(normText(title).split(" ").filter((w) => w.length >= 4));
+  if (!words.size) return true;
+  const t = " " + normText(text) + " ";
+  let hit = 0;
+  for (const w of words) if (t.includes(" " + w.slice(0, 5))) hit++; // 5-letter stem: Turkish suffixes vary
+  return hit >= Math.min(2, words.size);
+}
 
 function extractParagraphs(html) {
   let h = String(html || "")
@@ -469,12 +505,12 @@ function extractParagraphs(html) {
   const art = h.match(/<article[\s\S]*?<\/article>/i);
   const scope = art ? art[0] : h;
   // Boilerplate a <p> scrape picks up on JS-rendered shells (Google News, KAP
-  // SPA, generic nav/consent). If we can't get REAL prose we return nothing — the
-  // app then shows related headlines rather than junk. Never ship boilerplate.
-  const JUNK = /tüm kategoriler|aşağıdaki öneriler|özel durum açıklaması\s+finansal rapor|fon bildirimleri|çerez|cookie|abone ol|reklam|tüm hakları|giriş yap|kayıt ol|menü|javascript|tarayıcınız/i;
+  // SPA, generic nav/consent). If we can't get REAL prose we return nothing.
+  const JUNK = /tüm kategoriler|aşağıdaki öneriler|özel durum açıklaması\s+finansal rapor|fon bildirimleri|çerez|cookie|abone ol|reklam|tüm hakları|giriş yap|kayıt ol|menü|javascript|tarayıcınız|takip et|linki kopyala|tercih edilen kaynak|haber giriş|yazdır/i;
   const ps = [];
   for (const m of scope.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)) {
-    const t = decodeEntities(m[1].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+    // Twice: some outlets double-encode ("&amp;ccedil;").
+    const t = decodeEntities(decodeEntities(m[1].replace(/<[^>]+>/g, " "))).replace(/\s+/g, " ").trim();
     if (t.length < 60 || !/[.!?…]/.test(t) || JUNK.test(t)) continue;
     // Prose has plenty of lowercase; a run of Capitalised category labels does not.
     const lower = (t.match(/[a-zçğıöşü]/g) || []).length;
@@ -491,41 +527,120 @@ function summariseParagraphs(ps) {
     out = out ? out + "\n\n" + p : p;
     if (out.length >= SUMMARY_MAX_CHARS) break;
   }
-  if (out.length > SUMMARY_MAX_CHARS) out = out.slice(0, SUMMARY_MAX_CHARS - 1).trim() + "…";
-  return out.trim();
+  return clip(out);
 }
 
-async function fetchArticleSummary(url) {
+// Cut at the last sentence end inside the limit; otherwise at a word, with "…".
+function clip(text) {
+  let out = String(text || "").trim();
+  if (out.length <= SUMMARY_MAX_CHARS) return out;
+  out = out.slice(0, SUMMARY_MAX_CHARS);
+  const end = Math.max(out.lastIndexOf(". "), out.lastIndexOf("! "), out.lastIndexOf("? "));
+  if (end >= SUMMARY_MAX_CHARS * 0.5) return out.slice(0, end + 1).trim();
+  return out.slice(0, out.lastIndexOf(" ")).trim() + "…";
+}
+
+// The outlet's own description of the story, from the page head.
+function metaDescription(html) {
+  const res = [
+    /<meta[^>]+property=["']og:description["'][^>]*content="([^"]+)"/i,
+    /<meta[^>]+property=["']og:description["'][^>]*content='([^']+)'/i,
+    /<meta[^>]+content="([^"]+)"[^>]*property=["']og:description["']/i,
+    /<meta[^>]+name=["']description["'][^>]*content="([^"]+)"/i,
+    /<meta[^>]+name=["']description["'][^>]*content='([^']+)'/i,
+    /<meta[^>]+content="([^"]+)"[^>]*name=["']description["']/i,
+  ];
+  for (const re of res) {
+    const m = re.exec(html);
+    if (!m) continue;
+    let t = decodeEntities(decodeEntities(m[1])).replace(/\s+/g, " ").trim();
+    if (t.length < 80) continue;
+    // Outlets truncate these mid-word at a fixed length; mark the cut honestly.
+    if (!/[.!?…"”')]$/.test(t)) t = t.replace(/\.{2,}$/, "").trim() + "…";
+    return t;
+  }
+  return "";
+}
+
+// Google News RSS links are opaque. The article page carries a signature and a
+// timestamp that Google's own redirect endpoint exchanges for the publisher URL.
+// Fragile by nature (undocumented), so: one failure = no summary for that item,
+// and a 429 trips a breaker that stops resolving for the rest of the run.
+let googleBlocked = false;
+async function resolveGoogleNewsUrl(url) {
+  if (googleBlocked) return null;
   try {
-    // Google News RSS links are opaque redirect shells that don't resolve to the
-    // publisher server-side (they need a fragile, rate-limited Google endpoint),
-    // so never spend a request on them — the app falls back to related headlines.
-    const host = (() => { try { return new URL(url).hostname; } catch { return ""; } })();
-    if (/(^|\.)news\.google\.com$/.test(host) || /(^|\.)google\.com$/.test(host)) return null;
-    const signal = AbortSignal.timeout ? AbortSignal.timeout(SUMMARY_TIMEOUT_MS) : undefined;
-    const r = await fetch(url, {
-      redirect: "follow",
-      headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36", "Accept-Language": "tr,en;q=0.8" },
-      signal,
-    });
+    const id = new URL(url).pathname.split("/").pop();
+    if (!id) return null;
+    const sig = AbortSignal.timeout ? AbortSignal.timeout(SUMMARY_TIMEOUT_MS) : undefined;
+    const r = await fetch("https://news.google.com/rss/articles/" + id, { headers: { "User-Agent": BROWSER_UA }, signal: sig });
+    if (r.status === 429) { googleBlocked = true; return null; }
     if (!r.ok) return null;
-    const ct = r.headers.get("content-type") || "";
-    if (!/text\/html/i.test(ct)) return null;
     const html = await r.text();
-    const sum = summariseParagraphs(extractParagraphs(html));
-    return sum && sum.length >= 80 ? sum : null;
+    const sg = /data-n-a-sg="([^"]+)"/.exec(html)?.[1];
+    const ts = /data-n-a-ts="([^"]+)"/.exec(html)?.[1];
+    if (!sg || !ts) return null;
+    const inner = ["garturlreq", [["X", "X", ["X", "X"], null, null, 1, 1, "US:en", null, 1, null, null, null, null, null, 0, 1], "X", "X", 1, [1, 1, 1], 1, 1, null, 0, 0, null, 0], id, Number(ts), sg];
+    const body = "f.req=" + encodeURIComponent(JSON.stringify([[["Fbv4je", JSON.stringify(inner), null, "generic"]]]));
+    const sig2 = AbortSignal.timeout ? AbortSignal.timeout(SUMMARY_TIMEOUT_MS) : undefined;
+    const r2 = await fetch("https://news.google.com/_/DotsSplashUi/data/batchexecute", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8", "User-Agent": BROWSER_UA },
+      body, signal: sig2,
+    });
+    if (r2.status === 429) { googleBlocked = true; return null; }
+    if (!r2.ok) return null;
+    const m = /\[\\"garturlres\\",\\"([^"\\]+)/.exec(await r2.text());
+    if (!m) return null;
+    const out = m[1].replace(/\\u003d/g, "=").replace(/\\u0026/g, "&");
+    return /^https?:\/\//.test(out) && !/(^|\.)google\.com$/.test(new URL(out).hostname) ? out : null;
   } catch {
     return null;
   }
 }
 
+// → { summary, pub } — either may be null. `pub` is the publisher's own URL.
+async function fetchArticleSummary(url, title) {
+  let pub = null;
+  try {
+    const host = new URL(url).hostname;
+    let target = url;
+    if (/(^|\.)google\.com$/.test(host)) {
+      pub = await resolveGoogleNewsUrl(url);
+      if (!pub) return { summary: null, pub: null };
+      target = pub;
+    }
+    const signal = AbortSignal.timeout ? AbortSignal.timeout(SUMMARY_TIMEOUT_MS) : undefined;
+    const r = await fetch(target, {
+      redirect: "follow",
+      headers: { "User-Agent": BROWSER_UA, "Accept-Language": "tr,en;q=0.8" },
+      signal,
+    });
+    if (!r.ok) return { summary: null, pub };
+    const ct = r.headers.get("content-type") || "";
+    if (!/text\/html/i.test(ct)) return { summary: null, pub };
+    const html = await r.text();
+    const meta = metaDescription(html);
+    if (meta && sharesTopic(meta, title) && !isEchoSummary(meta, title, "")) return { summary: clip(meta), pub };
+    const paras = summariseParagraphs(extractParagraphs(html).filter((p) => sharesTopic(p, title)));
+    return { summary: paras && paras.length >= 80 ? paras : null, pub };
+  } catch {
+    return { summary: null, pub };
+  }
+}
+
 // Enrich a {sym: items[]} map in place: fill missing summaries, newest first,
-// capped per run. Items keep any summary they already have (cache).
-async function enrichSummaries(itemsBySym, cap = SUMMARY_MAX_PER_RUN) {
+// capped per run. A real summary is kept (cache); a "headline + source" echo
+// from the feed counts as missing. `st` counts failed tries.
+// `press`: only press items get the echo check — a KAP item's summary is its
+// subject line, which legitimately repeats part of the title.
+async function enrichSummaries(itemsBySym, { press = false, cap = SUMMARY_MAX_PER_RUN } = {}) {
   const pending = [];
   for (const sym of Object.keys(itemsBySym || {})) {
     for (const it of itemsBySym[sym] || []) {
-      if (it && it.url && !it.summary) pending.push(it);
+      if (!it || !it.url) continue;
+      if (press && it.summary && isEchoSummary(it.summary, it.title, it.source)) it.summary = null;
+      if (!it.summary && (it.st || 0) < SUMMARY_MAX_TRIES) pending.push(it);
     }
   }
   pending.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
@@ -533,10 +648,17 @@ async function enrichSummaries(itemsBySym, cap = SUMMARY_MAX_PER_RUN) {
   if (!batch.length) return 0;
   let filled = 0;
   await mapLimit(batch, SUMMARY_CONCURRENCY, async (it) => {
-    const s = await fetchArticleSummary(it.url);
-    if (s) { it.summary = s; filled++; }
-    else if (it.summary === undefined) it.summary = null;
+    const blockedBefore = googleBlocked;
+    const { summary, pub } = await fetchArticleSummary(it.url, it.title || "");
+    if (pub) it.pub = pub;
+    if (summary) { it.summary = summary; delete it.st; filled++; }
+    else {
+      if (it.summary === undefined) it.summary = null;
+      // A Google rate limit is not the article's fault — don't burn a try on it.
+      if (!googleBlocked && !blockedBefore) it.st = (it.st || 0) + 1;
+    }
   });
+  if (googleBlocked) console.log("  (Google yönlendirme çözümü sınırlandı — kalan özetler sonraki koşuya)");
   return filled;
 }
 
@@ -1037,11 +1159,11 @@ async function refreshNewsOnly(prevStocks) {
 
   if (news && news !== prevNews) {
     process.stdout.write("KAP özetleri çekiliyor… ");
-    console.log((await enrichSummaries(news)) + " eklendi");
+    console.log((await enrichSummaries(news, { cap: 30 })) + " eklendi");
   }
   if (!marketNews.skipped) {
     process.stdout.write("Haber özetleri çekiliyor… ");
-    console.log((await enrichSummaries(marketNews.items)) + " eklendi");
+    console.log((await enrichSummaries(marketNews.items, { press: true })) + " eklendi");
   }
 
   const prevCommodityNews = await readJson("commodityNews.json", { updatedAt: null, items: {} });
@@ -1354,11 +1476,11 @@ async function main() {
   // News redirect shells are skipped, so those keep the related-headlines fallback.
   if (news && news !== prevNews) {
     process.stdout.write("KAP özetleri çekiliyor… ");
-    console.log((await enrichSummaries(news)) + " eklendi");
+    console.log((await enrichSummaries(news, { cap: 30 })) + " eklendi");
   }
   if (!marketNews.skipped) {
     process.stdout.write("Haber özetleri çekiliyor… ");
-    console.log((await enrichSummaries(marketNews.items)) + " eklendi");
+    console.log((await enrichSummaries(marketNews.items, { press: true })) + " eklendi");
   }
 
   // 3c1) Commodity news (gold/silver/platinum/palladium/copper), same hourly gate.
