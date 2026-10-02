@@ -6,9 +6,12 @@ name: Refresh data
 
 on:
   schedule:
-    # Her 10 dk, hafta içi, ~10:00–18:55 TSİ (UTC+3 → 07:00–15:55 UTC).
-    # GitHub cron gecikmelerine karşı 10 dk seçildi; public repo = sınırsız Actions.
-    - cron: "*/10 7-15 * * 1-5"
+    # Her 10 dk, hafta içi, 10:00–18:10 TSİ (UTC+3 → 07:00–15:10 UTC) — seans + kapanış.
+    # Özel depo: Actions 2.000 dk/ay. 18:20–18:50 koşuları kapanıştan sonraydı, kaldırıldı.
+    # Bütçe (2026-10-01 ölçümü, koşu başı ~1,3 dk): beklenen ≈1.230 dk/ay, GitHub tüm
+    # koşuları çalıştırsa ≈1.900 dk/ay. Sıklığı artırmadan önce bu hesabı yenile.
+    - cron: "*/10 7-14 * * 1-5"
+    - cron: "0,10 15 * * 1-5"
   workflow_dispatch: {}
 
 permissions:

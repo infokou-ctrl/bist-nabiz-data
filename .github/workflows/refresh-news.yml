@@ -7,8 +7,10 @@ name: Refresh news (7/24)
 
 on:
   schedule:
-    # Her saatin 5. dakikası, 06:00–21:00 UTC (≈09:00–24:00 TSİ), HER GÜN (hafta sonu dahil).
-    - cron: "5 6-21 * * *"
+    # 2 saatte bir, :05'te, 06:00–20:00 UTC (≈09:00–23:00 TSİ), HER GÜN (hafta sonu dahil).
+    # Saatlikti; özel depoda Actions dakikası sınırlı olduğu için 2026-10-02'de seyreltildi
+    # (koşu ~65 sn → 2 dk faturalanıyor). Seans içinde 10 dk'lık akış da saat başı haber çeker.
+    - cron: "5 6-20/2 * * *"
   workflow_dispatch: {}
 
 permissions:

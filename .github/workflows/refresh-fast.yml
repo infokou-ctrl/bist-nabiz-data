@@ -4,10 +4,11 @@ name: Refresh fast (intraday)
 # Ağır 1y chart/temel/haber döngüsüne DOKUNMAZ; yalnızca data/intraday.json yazar.
 # Uygulama bunu stocks.json üstüne merge eder (bkz. src/data.ts).
 
+# ZAMANLAMA KAPALI (2026-10-02): depo PRIVATE yapılıyor; özel depoda Actions 2.000 dk/ay
+# ile sınırlı ve bu katman tek başına ~26 dk/gün yiyordu. Uygulama, anlık görüntüden
+# eski intraday.json'u yok sayar (src/data.ts mergeIntraday). Elle çalıştırma duruyor.
+# Geri açmak için: schedule bloğunu geri koy (GitHub Pro = 3.000 dk).
 on:
-  schedule:
-    # Her 2 dk, hafta içi, ~10:00–18:55 TSİ (07:00–15:55 UTC). Public repo = sınırsız.
-    - cron: "*/2 7-15 * * 1-5"
   workflow_dispatch: {}
 
 permissions:
