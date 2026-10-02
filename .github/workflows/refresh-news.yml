@@ -39,7 +39,7 @@ jobs:
         if: steps.guard.outputs.paused == 'false'
         with:
           node-version: "20"
-      - run: npm install --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund
         if: steps.guard.outputs.paused == 'false'
       - run: node refresh-cloud.mjs --news-only
         if: steps.guard.outputs.paused == 'false'
