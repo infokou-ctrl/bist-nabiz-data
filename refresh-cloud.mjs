@@ -288,6 +288,33 @@ const NAMED_ENTITIES = {
   rsquo: "’", lsquo: "‘", ldquo: "“", rdquo: "”", hellip: "…", ndash: "–", mdash: "—", laquo: "«", raquo: "»",
 };
 
+// ---- trusted sources (2026-10-04) --------------------------------------------
+// The owner asked that news come only from reliable outlets. Google News mixes in
+// hundreds of small blogs and local papers (227 sources in 1.244 items, measured);
+// only these are kept: news agencies, national media, established business press.
+// Matched on the publisher's host (RSS <source url> for new items, the resolved
+// `pub` URL for archived ones). Edit this list to add/remove an outlet.
+const TRUSTED_NEWS = [
+  // haber ajansları
+  "aa.com.tr", "iha.com.tr", "dha.com.tr", "ankahaber.net", "hibya.com",
+  // ulusal yayın kuruluşları
+  "hurriyet.com.tr", "milliyet.com.tr", "sabah.com.tr", "sozcu.com.tr", "haberturk.com", "ntv.com.tr", "cnnturk.com",
+  "trthaber.com", "t24.com.tr", "cumhuriyet.com.tr", "yenisafak.com", "karar.com", "bbc.com", "dw.com", "reuters.com",
+  "independentturkish.com", "mynet.com",
+  // ekonomi / finans yayınları
+  "dunya.com", "ekonomim.com", "bloomberght.com", "businessht.com.tr", "ekonomigazetesi.com", "investing.com", "cnbce.com",
+  "forbes.com.tr", "fortuneturkey.com", "patronlardunyasi.com", "foreks.com", "paraanaliz.com", "borsagundem.com.tr",
+  "paratic.com", "ekoturk.com", "doviz.com", "matriksdata.com", "ekonomist.com.tr", "capital.com.tr", "tradingview.com",
+];
+function isTrustedUrl(u) {
+  try {
+    const h = new URL(u).hostname.replace(/^www\./, "");
+    return TRUSTED_NEWS.some((d) => h === d || h.endsWith("." + d));
+  } catch { return false; }
+}
+// Archived items carry the resolved publisher URL; fresh RSS items the outlet's home page.
+const isTrustedItem = (it) => isTrustedUrl(it.pub || it.site || "");
+
 function parseRssItems(xml) {
   const items = [];
   const blocks = xml.match(/<item>([\s\S]*?)<\/item>/g) || [];
@@ -298,6 +325,7 @@ function parseRssItems(xml) {
     };
     let title = pick("title");
     const source = pick("source");
+    const site = (b.match(/<source[^>]*\burl="([^"]+)"/) || [])[1] || null; // the outlet's home page
     const link = pick("link");
     const pub = pick("pubDate");
     // Google News titles are "Headline - Source"; drop the trailing source.
@@ -315,7 +343,7 @@ function parseRssItems(xml) {
     let date = null;
     if (pub) { const d = new Date(pub); if (!isNaN(d.getTime())) date = d.toISOString(); }
     if (!title || title === "Google Haberler" || !link) continue;
-    items.push({ title, date, url: link, source: source || null, summary: summary || null });
+    items.push({ title, date, url: link, source: source || null, site, summary: summary || null });
   }
   return items;
 }
@@ -382,6 +410,9 @@ function isJunkNews(title) {
   if (/KAP\s*Haberleri/i.test(t)) return true;
   if (/tarihli\s*$/i.test(t)) return true;
   if (/^\s*\*{2,}/.test(t)) return true;
+  // Quote / chart / forum / comment pages, not news ("AKBANK Hisse Senedi Canlı
+  // Grafik", "VAKBN Hisse Yorumları", "… Forumu", "(GUBRF) Hisse Senedi").
+  if (/hisse senedi\s*(canlı grafik)?\s*$|canlı grafik|hisse yorumları|güncel yorumlar|forumu?\b|tradingview görüşleri|\)\s*hisse senedi\s*$/i.test(t)) return true;
   return false;
 }
 function cleanMarketTitle(title) {
@@ -409,7 +440,7 @@ async function fetchMarketNews(stocks, prev) {
   for (const [sym, items] of Object.entries(prevItems)) {
     const rel = relevanceBySym[sym];
     if (!rel) { out[sym] = items.slice(); continue; }
-    out[sym] = items.filter((n) => rel(n.title || "") && !isJunkNews(n.title || ""))
+    out[sym] = items.filter((n) => rel(n.title || "") && !isJunkNews(n.title || "") && isTrustedItem(n))
       .map((n) => ({ ...n, title: cleanMarketTitle(n.title || "") }));
     purged += items.length - out[sym].length;
   }
@@ -440,6 +471,7 @@ async function fetchMarketNews(stocks, prev) {
       (seen[s.symbol] ||= new Set());
       for (const it of items) {
         if (!relevant(it.title || "")) continue; // company-specific only
+        if (!isTrustedItem(it)) continue;        // reliable outlets only
         if (isJunkNews(it.title)) continue;      // drop KAP mirrors / stubs
         it.title = cleanMarketTitle(it.title);
         const key = (it.title || "").toLowerCase();
@@ -472,8 +504,8 @@ async function fetchMarketNews(stocks, prev) {
 const SUMMARY_MAX_PER_RUN = Number(process.env.SUMMARY_CAP) || 120; // CI: modest; local backfill sets SUMMARY_CAP
 const SUMMARY_CONCURRENCY = 4;
 const SUMMARY_TIMEOUT_MS = 9000;
-const SUMMARY_MAX_CHARS = 750;   // the article's opening — enough to read the news, not the whole article
-const SUMMARY_VERSION = 2;        // bump to re-process stored summaries with improved rules
+const SUMMARY_MAX_CHARS = 1200;  // the article's opening incl. its list/table — enough to read the news, not the whole article
+const SUMMARY_VERSION = 3;        // bump to re-process stored summaries with improved rules
 const SUMMARY_MAX_TRIES = 2;      // a page that failed twice is not retried every hour
 const BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36";
 
@@ -502,30 +534,60 @@ function extractParagraphs(html) {
   let h = String(html || "")
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<(nav|header|footer|aside|form)\b[\s\S]*?<\/\1>/gi, " ");
   const art = h.match(/<article[\s\S]*?<\/article>/i);
   const scope = art ? art[0] : h;
   // Boilerplate a <p> scrape picks up on JS-rendered shells (Google News, KAP
   // SPA, generic nav/consent). If we can't get REAL prose we return nothing.
-  const JUNK = /tüm kategoriler|aşağıdaki öneriler|özel durum açıklaması\s+finansal rapor|fon bildirimleri|çerez|cookie|abone ol|reklam|tüm hakları|giriş yap|kayıt ol|menü|javascript|tarayıcınız|takip et|linki kopyala|tercih edilen kaynak|haber giriş|yazdır/i;
+  const JUNK = /tüm kategoriler|aşağıdaki öneriler|özel durum açıklaması\s+finansal rapor|fon bildirimleri|çerez|cookie|abone ol|reklam|tüm hakları|giriş yap|kayıt ol|menü|javascript|tarayıcınız|takip et|linki kopyala|tercih edilen kaynak|haber giriş|yazdır|ilgili haberler|etiketler|paylaş/i;
+  const txt = (x) => decodeEntities(decodeEntities(String(x).replace(/<br\s*\/?>/gi, " ").replace(/<[^>]+>/g, " "))).replace(/\s+/g, " ").trim();
   const ps = [];
-  for (const m of scope.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)) {
-    // Twice: some outlets double-encode ("&amp;ccedil;").
-    const t = decodeEntities(decodeEntities(m[1].replace(/<[^>]+>/g, " "))).replace(/\s+/g, " ").trim();
-    if (t.length < 60 || !/[.!?…]/.test(t) || JUNK.test(t)) continue;
-    // Prose has plenty of lowercase; a run of Capitalised category labels does not.
-    const lower = (t.match(/[a-zçğıöşü]/g) || []).length;
-    if (lower / t.length < 0.5) continue;
-    ps.push(t);
+  let started = !!art; // list items / table rows only once real content has begun (not nav menus)
+  // Paragraphs, list items and table rows in document order — a "15 hisse için
+  // hedef fiyat" story keeps its actual list, not just the intro sentence.
+  const seenLine = new Set();
+  const add = (line) => { if (!seenLine.has(line)) { seenLine.add(line); ps.push(line); } }; // repeated table headers once
+  for (const m of scope.matchAll(/<(p|li|tr|h2|h3|h4)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
+    const tag = m[1].toLowerCase();
+    if (tag[0] === "h") {
+      // Sub-headings name what the next list/table is about ("ASELS — Aselsan").
+      const t = txt(m[2]);
+      if (started && t.length >= 3 && t.length <= 100 && !JUNK.test(t)) add("• ▸ " + t);
+      continue;
+    }
+    if (tag === "p") {
+      const t = txt(m[2]);
+      if (t.length < 60 || !/[.!?…]/.test(t) || JUNK.test(t)) continue;
+      // Prose has plenty of lowercase; a run of Capitalised category labels does not.
+      const lower = (t.match(/[a-zçğıöşü]/g) || []).length;
+      if (lower / t.length < 0.5) continue;
+      ps.push(t); started = true;
+    } else if (!started) {
+      continue;
+    } else if (tag === "li") {
+      const t = txt(m[2]);
+      // Menu-like items are short link text; real list items carry content.
+      if (t.length < 12 || t.length > 300 || JUNK.test(t) || (/<a\b/i.test(m[2]) && t.length < 40)) continue;
+      add("• " + t);
+    } else {
+      const cells = [...m[2].matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi)].map((c) => txt(c[1])).filter(Boolean);
+      if (cells.length < 2 || cells.some((c) => c.length > 80)) continue;
+      add("• " + cells.join(" · "));
+    }
   }
   return ps;
 }
 
 function summariseParagraphs(ps) {
   let out = "";
+  let prevList = false;
   for (const p of ps) {
-    if (out && (out.length + 2 + p.length) > SUMMARY_MAX_CHARS) break;
-    out = out ? out + "\n\n" + p : p;
+    const isList = p.startsWith("• ");
+    const sep = !out ? "" : isList && prevList ? "\n" : "\n\n";
+    if (out && (out.length + sep.length + p.length) > SUMMARY_MAX_CHARS) break;
+    out += sep + p;
+    prevList = isList;
     if (out.length >= SUMMARY_MAX_CHARS) break;
   }
   return clip(out);
@@ -627,6 +689,7 @@ function articleLede(html, title) {
   const meta = cleanText(metaDescription(html).replace(/…$/, ""));
   if (meta && meta.length >= 60 && sharesTopic(meta, title) && !isEchoSummary(meta, title, "") && !notNews(meta)) parts.push(meta);
   for (const p0 of extractParagraphs(html)) {
+    if (p0.startsWith("• ")) { if (parts.length) parts.push(p0); continue; } // list/table lines follow the text they belong to
     const p = cleanText(p0);
     if (p.length < 60 || notNews(p) || !sharesTopic(p, title) && !parts.length) continue;
     if (parts.some((q) => sameStart(q, p) || normText(q).includes(normText(p).slice(0, 80)))) continue;
@@ -856,7 +919,7 @@ async function fetchCommodityNews(prev) {
       const list = [];
       for (const it of items) {
         const k = (it.title || "").toLowerCase();
-        if (!k || seen.has(k)) continue;
+        if (!k || seen.has(k) || !isTrustedItem(it)) continue; // reliable outlets only
         seen.add(k);
         list.push(it);
       }
