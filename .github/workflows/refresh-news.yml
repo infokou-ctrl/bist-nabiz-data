@@ -3,7 +3,7 @@ name: Refresh news (7/24)
 # Sadece haberleri tazeler (news.json / marketNews.json / commodityNews.json).
 # Fiyat/teknik/temel dosyalara DOKUNMAZ. Amaç: borsa kapalıyken de (hafta sonu
 # dahil) taze haber akışı — kullanıcı hafta sonu program kurabilsin.
-# Saat kapısı (dakika < 15) fetchMarketNews içinde; cron :05'te çalışır → geçer.
+# Saat kapısı (dakika < 15) fetchMarketNews içinde; bu akış FORCE_NEWS=1 ile onu atlar.
 
 on:
   schedule:
@@ -44,6 +44,11 @@ jobs:
       - run: node refresh-cloud.mjs --news-only
         if: steps.guard.outputs.paused == 'false'
         continue-on-error: true
+        # Bu akışın tek işi haber: saat kapısını (dakika < 15) atla. GitHub zamanlanmış
+        # koşuları sık sık 15–60 dk geciktiriyor; 2026-10-03'te 4 koşunun 3'ü kapıya
+        # takılıp hiç basın haberi çekmeden bitti.
+        env:
+          FORCE_NEWS: "1"
       - name: Commit news
         if: steps.guard.outputs.paused == 'false'
         run: |
