@@ -540,7 +540,7 @@ function extractParagraphs(html) {
   const scope = art ? art[0] : h;
   // Boilerplate a <p> scrape picks up on JS-rendered shells (Google News, KAP
   // SPA, generic nav/consent). If we can't get REAL prose we return nothing.
-  const JUNK = /tüm kategoriler|aşağıdaki öneriler|özel durum açıklaması\s+finansal rapor|fon bildirimleri|çerez|cookie|abone ol|reklam|tüm hakları|giriş yap|kayıt ol|menü|javascript|tarayıcınız|takip et|linki kopyala|tercih edilen kaynak|haber giriş|yazdır|ilgili haberler|etiketler|paylaş/i;
+  const JUNK = /tüm kategoriler|aşağıdaki öneriler|özel durum açıklaması\s+finansal rapor|fon bildirimleri|çerez|cookie|abone ol|reklam|tüm hakları|giriş yap|kayıt ol|menü|javascript|tarayıcınız|takip et|linki kopyala|tercih edilen kaynak|haber giriş|yazdır|ilgili haberler|etiketler|paylaş|takip edin|google[’']?da|bizi takip|whatsapp kanal|telegram kanal|bildirimleri aç|e-?bülten|son dakika haberleri için/i;
   const txt = (x) => decodeEntities(decodeEntities(String(x).replace(/<br\s*\/?>/gi, " ").replace(/<[^>]+>/g, " "))).replace(/\s+/g, " ").trim();
   const ps = [];
   let started = !!art; // list items / table rows only once real content has begun (not nav menus)
