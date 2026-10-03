@@ -472,7 +472,8 @@ async function fetchMarketNews(stocks, prev) {
 const SUMMARY_MAX_PER_RUN = Number(process.env.SUMMARY_CAP) || 120; // CI: modest; local backfill sets SUMMARY_CAP
 const SUMMARY_CONCURRENCY = 4;
 const SUMMARY_TIMEOUT_MS = 9000;
-const SUMMARY_MAX_CHARS = 420;
+const SUMMARY_MAX_CHARS = 750;   // the article's opening — enough to read the news, not the whole article
+const SUMMARY_VERSION = 2;        // bump to re-process stored summaries with improved rules
 const SUMMARY_MAX_TRIES = 2;      // a page that failed twice is not retried every hour
 const BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36";
 
@@ -599,13 +600,46 @@ async function resolveGoogleNewsUrl(url) {
   }
 }
 
+// Teaser tails outlets append to descriptions ("İşte detaylar;…"). Cut, not shown.
+const TEASER = /\s*[İIi]şte\s+(?:detaylar|ayrıntılar)[^.]*$|\s*(?:detaylar|ayrıntılar)\s+haber(?:imiz|in)?(?:de|in devamında)[^.]*$|\s*(?:haberin\s+)?devamı(?:\s+için)?[^.]*(?:tıklayın|haberimizde)[^.]*$|\s*ayrıntılar\s+için[^.]*$/i;
+// Not news text: a stock's quote page blurb, or a page whose "description" is a
+// run of other headlines (several "!" or title-cased fragments).
+function notNews(t) {
+  if (/sayfasında .{0,60}(grafiğini|güncel fiyatını)|fiyatını .{0,40} sayfasında bulabilirsiniz/i.test(t)) return true;
+  if ((t.match(/!/g) || []).length >= 2) return true;
+  return false;
+}
+function cleanText(t) {
+  return String(t || "").replace(TEASER, "").replace(/[;:,\s]+$/, "").replace(/\s+/g, " ").trim();
+}
+// Near-duplicate check: the meta description is often the first paragraph again.
+const sameStart = (a, b) => normText(a).slice(0, 60) === normText(b).slice(0, 60);
+
+// The article's opening: the outlet's own description, then its first relevant
+// paragraphs, up to SUMMARY_MAX_CHARS, cut at a sentence end.
+function articleLede(html, title) {
+  const parts = [];
+  const meta = cleanText(metaDescription(html).replace(/…$/, ""));
+  if (meta && meta.length >= 60 && sharesTopic(meta, title) && !isEchoSummary(meta, title, "") && !notNews(meta)) parts.push(meta);
+  for (const p0 of extractParagraphs(html)) {
+    const p = cleanText(p0);
+    if (p.length < 60 || notNews(p) || !sharesTopic(p, title) && !parts.length) continue;
+    if (parts.some((q) => sameStart(q, p) || normText(q).includes(normText(p).slice(0, 80)))) continue;
+    parts.push(p);
+    if (parts.join("\n\n").length >= SUMMARY_MAX_CHARS) break;
+  }
+  if (!parts.length) return null;
+  const out = summariseParagraphs(parts);
+  return out && out.length >= 80 ? out : null;
+}
+
 // → { summary, pub } — either may be null. `pub` is the publisher's own URL.
-async function fetchArticleSummary(url, title) {
-  let pub = null;
+async function fetchArticleSummary(url, title, knownPub = null) {
+  let pub = knownPub;
   try {
     const host = new URL(url).hostname;
-    let target = url;
-    if (/(^|\.)google\.com$/.test(host)) {
+    let target = pub || url;
+    if (!pub && /(^|\.)google\.com$/.test(host)) {
       pub = await resolveGoogleNewsUrl(url);
       if (!pub) return { summary: null, pub: null };
       target = pub;
@@ -620,10 +654,7 @@ async function fetchArticleSummary(url, title) {
     const ct = r.headers.get("content-type") || "";
     if (!/text\/html/i.test(ct)) return { summary: null, pub };
     const html = await r.text();
-    const meta = metaDescription(html);
-    if (meta && sharesTopic(meta, title) && !isEchoSummary(meta, title, "")) return { summary: clip(meta), pub };
-    const paras = summariseParagraphs(extractParagraphs(html).filter((p) => sharesTopic(p, title)));
-    return { summary: paras && paras.length >= 80 ? paras : null, pub };
+    return { summary: articleLede(html, title), pub };
   } catch {
     return { summary: null, pub };
   }
@@ -640,7 +671,9 @@ async function enrichSummaries(itemsBySym, { press = false, cap = SUMMARY_MAX_PE
     for (const it of itemsBySym[sym] || []) {
       if (!it || !it.url) continue;
       if (press && it.summary && isEchoSummary(it.summary, it.title, it.source)) it.summary = null;
-      if (!it.summary && (it.st || 0) < SUMMARY_MAX_TRIES) pending.push(it);
+      // Summaries from older rules are redone once (they have the publisher URL already).
+      const stale = press && it.summary && it.sv !== SUMMARY_VERSION;
+      if ((!it.summary || stale) && (it.st || 0) < SUMMARY_MAX_TRIES) pending.push(it);
     }
   }
   pending.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
@@ -649,10 +682,15 @@ async function enrichSummaries(itemsBySym, { press = false, cap = SUMMARY_MAX_PE
   let filled = 0;
   await mapLimit(batch, SUMMARY_CONCURRENCY, async (it) => {
     const blockedBefore = googleBlocked;
-    const { summary, pub } = await fetchArticleSummary(it.url, it.title || "");
+    const { summary, pub } = await fetchArticleSummary(it.url, it.title || "", it.pub || null);
     if (pub) it.pub = pub;
-    if (summary) { it.summary = summary; delete it.st; filled++; }
-    else {
+    if (summary) { it.summary = summary; if (press) it.sv = SUMMARY_VERSION; delete it.st; filled++; }
+    else if (press && it.summary && it.sv !== SUMMARY_VERSION) {
+      // Re-read failed: keep the old text only if it passes today's rules.
+      const old = cleanText(it.summary);
+      it.summary = old.length >= 60 && !notNews(old) ? old : null;
+      it.sv = SUMMARY_VERSION;
+    } else {
       if (it.summary === undefined) it.summary = null;
       // A Google rate limit is not the article's fault — don't burn a try on it.
       if (!googleBlocked && !blockedBefore) it.st = (it.st || 0) + 1;
@@ -660,6 +698,124 @@ async function enrichSummaries(itemsBySym, { press = false, cap = SUMMARY_MAX_PE
   });
   if (googleBlocked) console.log("  (Google yönlendirme çözümü sınırlandı — kalan özetler sonraki koşuya)");
   return filled;
+}
+
+// ---- KAP disclosure text ------------------------------------------------------
+// The KAP feed gives only a subject line. The disclosure page (Next.js) streams
+// its content as self.__next_f.push([1,"…"]) chunks; inside is the filing as
+// HTML: the company's own explanation (Turkish + English) and form fields
+// (label → value rows, or header-row tables). Official public statements — shown
+// in full in the app, attributed to KAP. Stored in kapText.json keyed by the
+// disclosure number, loaded by the app only when a KAP item is opened.
+const KAP_TEXT_DAYS = 14;      // fetch text for disclosures this recent
+const KAP_TEXT_KEEP_DAYS = 45; // drop older entries from the file
+const KAP_TEXT_MAX = 1500;
+// KAP answers 429 to bursts (measured 2026-10-04): one page at a time, a pause
+// between, stop for the run at the first 429. The newest filings go first.
+const KAP_TEXT_PER_RUN = Number(process.env.KAP_TEXT_CAP) || 60;
+const KAP_TEXT_GAP_MS = 700;
+const EN_WORDS = /\b(the|of|and|our|has|been|with|that|which|is|are|to|regarding|company)\b/gi;
+const isEnglish = (t) => (t.match(EN_WORDS) || []).length >= 3 && !/[çğışöüÇĞİŞÖÜ]/.test(t);
+const strip = (h) => decodeEntities(decodeEntities(String(h).replace(/<br\s*\/?>/gi, " ").replace(/<[^>]+>/g, " "))).replace(/\s+/g, " ").trim();
+
+function kapTextFromHtml(html) {
+  let payload = "";
+  for (const m of String(html).matchAll(/self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)/g)) {
+    try { payload += JSON.parse(m[1]); } catch { /* skip chunk */ }
+  }
+  if (!payload) return null;
+  const fields = [];
+  const seenLabel = new Set();
+  const push = (l, v) => {
+    l = strip(l); v = strip(v);
+    // "Müşteri (Customer)", "Hayır (No)": drop the English twin in parentheses.
+    const twin = /^(.+?)\s*\(([A-Za-z][A-Za-z ]*)\)$/.exec(v);
+    if (twin && /[^\x00-\x7F]/.test(twin[1])) v = twin[1];
+    if (!l || !v || l === v || l.length > 120 || v.length > 300 || /^oda_|^-$/.test(v) || isEnglish(l) || seenLabel.has(l)) return;
+    if (/^(evet|hayır)$/i.test(v) && /ertelenmiş|ertelenen/i.test(l)) return; // boilerplate yes/no
+    // KAP's form scaffolding: template placeholders, empty lists, the bilingual
+    // header row ("Türkçe Turkish / İngilizce English"), update/correction flags.
+    if (/[\[\]]/.test(l + v) || /\?$/.test(v)) return;
+    if (/^(ilgili (şirketler|fonlar)|türkçe|yapılan açıklama (güncelleme|düzeltme)|update notification|correction notification|bildirim içeriği|announcement content)/i.test(l)) return;
+    // English labels of the bilingual form (no Turkish letters + a common English word).
+    if (!/[çğışöüÇĞİŞÖÜ]/.test(l) && /\b(of|the|if|date|business|contract|content|explanations?|expected|nature|name|amount|share|capital|company|board|decision|announcement)\b/i.test(l)) return;
+    if (/\b(Related|Notification|Flag|Turkish|English|Companies|Funds)\b/.test(l + " " + v)) return;
+    seenLabel.add(l); fields.push([l, v]);
+  };
+  // Innermost rows only (no nested <tr>).
+  const rows = [...payload.matchAll(/<tr\b[^>]*>((?:(?!<tr\b)[\s\S])*?)<\/tr>/gi)].map((m) =>
+    [...m[1].matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((c) => c[1]));
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (r.length === 2) push(r[0], r[1]);
+    else if (r.length > 2 && rows[i + 1] && rows[i + 1].length === r.length) {
+      // A header row + its value row. If the "values" hold no digit at all they are
+      // more headers (KAP nests label tables) — pairing them would read label = label.
+      if (rows[i + 1].some((c) => /\d/.test(strip(c)))) r.forEach((h, k) => push(h, rows[i + 1][k]));
+      i++;
+    }
+  }
+  // Taxonomy forms (e.g. "Yeni İş İlişkisi"): the Turkish label sits in a nested
+  // table (gwt-Label … content-tr), its value in the next
+  // <td class="taxonomy-context-value … content-tr">. Pair each value with the
+  // closest label before it.
+  const labels = [...payload.matchAll(/class="gwt-Label multi-language-content content-tr"[^>]*>([\s\S]*?)<\/div>/g)]
+    .map((m) => ({ at: m.index, text: m[1] }));
+  for (const m of payload.matchAll(/class="taxonomy-context-value[^"]*content-tr[^"]*"[^>]*>([\s\S]*?)<\/td>/g)) {
+    let lab = null;
+    for (const l of labels) { if (l.at < m.index) lab = l; else break; }
+    if (lab) push(lab.text, m[1]);
+  }
+  const prose = [];
+  for (const m of payload.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)) {
+    const t = strip(m[1]);
+    if (t.length >= 40 && !isEnglish(t) && !/^oda_/.test(t) && !prose.includes(t)) prose.push(t);
+  }
+  let text = "";
+  for (const p of prose) {
+    if (text && text.length + p.length + 2 > KAP_TEXT_MAX) break;
+    text = text ? text + "\n\n" + p : p;
+  }
+  if (text.length > KAP_TEXT_MAX) text = text.slice(0, KAP_TEXT_MAX - 1).replace(/\s+\S*$/, "") + "…";
+  const f = fields.filter(([l]) => !prose.some((p) => p.includes(l))).slice(0, 12);
+  return text || f.length ? { t: text || null, f } : null;
+}
+
+async function enrichKapText(news, prev) {
+  const out = {};
+  const keepAfter = Date.now() - KAP_TEXT_KEEP_DAYS * 864e5;
+  for (const [id, v] of Object.entries(prev || {})) if (v && Date.parse(v.d) >= keepAfter) out[id] = v;
+  const fetchAfter = Date.now() - KAP_TEXT_DAYS * 864e5;
+  const pending = [];
+  const seenId = new Set();
+  for (const items of Object.values(news || {})) {
+    for (const it of items || []) {
+      const id = /\/Bildirim\/(\d+)/.exec(it.url || "")?.[1];
+      if (!id || seenId.has(id) || out[id] || !(Date.parse(it.date) >= fetchAfter)) continue;
+      // Routine debt-instrument filings carry no reader text worth fetching.
+      if (/finansman bonosu|borçlanma aracı|kira sertifikası|varant|pay dışında sermaye piyasası aracı/i.test(it.title || "")) continue;
+      seenId.add(id); pending.push({ id, date: it.date });
+    }
+  }
+  pending.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  let filled = 0, limited = false;
+  for (const { id, date } of pending.slice(0, KAP_TEXT_PER_RUN)) {
+    try {
+      const r = await fetch("https://www.kap.org.tr/tr/Bildirim/" + id, {
+        headers: { "User-Agent": BROWSER_UA, "Accept-Language": "tr" },
+        signal: AbortSignal.timeout ? AbortSignal.timeout(SUMMARY_TIMEOUT_MS) : undefined,
+      });
+      if (r.status === 429) { limited = true; break; }
+      if (r.ok) {
+        const x = kapTextFromHtml(await r.text());
+        if (x) { out[id] = { d: String(date).slice(0, 10), ...x }; filled++; }
+      }
+    } catch { /* next run */ }
+    await new Promise((res) => setTimeout(res, KAP_TEXT_GAP_MS));
+  }
+  console.log("  KAP bildirim metni: " + filled + " eklendi · toplam " + Object.keys(out).length +
+    " · bekleyen " + Math.max(0, pending.length - filled) + (limited ? " (KAP sınırı — sonraki koşuda devam)" : ""));
+  return out;
 }
 
 // ---- commodity news (Google News RSS, per metal) -------------------------
@@ -1169,6 +1325,10 @@ async function refreshNewsOnly(prevStocks) {
   const prevCommodityNews = await readJson("commodityNews.json", { updatedAt: null, items: {} });
   const commodityNews = await fetchCommodityNews(prevCommodityNews);
 
+  {
+    const kapText = await enrichKapText(news, await readJson("kapText.json", {}));
+    await fs.writeFile(path.join(DATA_DIR, "kapText.json"), JSON.stringify(kapText));
+  }
   if (news !== prevNews) await fs.writeFile(path.join(DATA_DIR, "news.json"), JSON.stringify(news));
   await fs.writeFile(path.join(DATA_DIR, "marketNews.json"), JSON.stringify({ updatedAt: marketNews.updatedAt, items: marketNews.items || {} }));
   await fs.writeFile(path.join(DATA_DIR, "commodityNews.json"), JSON.stringify({ updatedAt: commodityNews.updatedAt, items: commodityNews.items || {} }));
@@ -1541,6 +1701,10 @@ async function main() {
   }
   const newsCount = Object.keys(news).length;
   // only overwrite news.json if we actually got fresh data (fetchNews returns prevNews on failure)
+  {
+    const kapText = await enrichKapText(news, await readJson("kapText.json", {}));
+    await fs.writeFile(path.join(DATA_DIR, "kapText.json"), JSON.stringify(kapText));
+  }
   if (news !== prevNews) await fs.writeFile(path.join(DATA_DIR, "news.json"), JSON.stringify(news));
   const mnItems = marketNews.items || {};
   await fs.writeFile(path.join(DATA_DIR, "marketNews.json"), JSON.stringify({ updatedAt: marketNews.updatedAt, items: mnItems }));
