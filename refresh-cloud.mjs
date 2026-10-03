@@ -137,7 +137,88 @@ const SECTOR_TR = {
 const SECTOR_SYMBOL = {
   "GSRAY": "Spor", "FENER": "Spor", "BJKAS": "Spor", "TSPOR": "Spor",
 };
+// ---- BIST/KAP official sector classification (2026-10-04) ---------------------
+// Yahoo's sectors are 11 broad buckets (THYAO and ASELS both "Sanayi"). The owner
+// asked for Borsa İstanbul's own, detailed classification: KAP's "Sektörler" page
+// lists every listed company under its official sector (e.g. ASELS → Savunma,
+// THYAO → Ulaştırma ve Depolama, GARAN → Bankalar). Cached in data/sectors.json,
+// refreshed weekly; Yahoo's sector stays only as a fallback for unlisted codes.
+let KAP_SECTORS = {};
+const SECTOR_MAX_AGE_DAYS = 7;
+// Official names are long; a short label that keeps the meaning.
+const SECTOR_SHORT = {
+  "Tarım ve Hayvancılık Avcılık ve İlgili Hizmet Faaliyetleri": "Tarım ve Hayvancılık",
+  "Kömür ve Linyit Madenciliği": "Kömür Madenciliği",
+  "Ham Petrol ve Doğal Gaz Çıkartılması": "Petrol ve Doğal Gaz Üretimi",
+  "Diğer Madencilik ve Taş Ocakçılığı": "Diğer Madencilik",
+  "Metal Cevheri Madenciliği": "Metal Madenciliği",
+  "Kağıt ve Kağıt Ürünleri Basım": "Kağıt ve Basım",
+  "Kimya İlaç Petrol Lastik ve Plastik Ürünler": "Kimya, İlaç, Petrol ve Plastik",
+  "Metal Eşya Makine Elektrikli Cihazlar ve Ulaşım Araçları": "Metal Eşya, Makine ve Taşıt",
+  "İnşaat ve Bayındırlık İşleri": "İnşaat",
+  "Finansal Kiralama ve Faktoring Şirketleri": "Kiralama ve Faktoring",
+  "Holdingler ve Yatırım Şirketleri": "Holdingler",
+  "Gayrimenkul Yatırım Ortaklıkları": "GYO (Gayrimenkul)",
+  "Menkul Kıymet Yatırım Ortaklıkları": "Menkul Kıymet Yat. Ort.",
+  "Girişim Sermayesi Yatırım Ortaklıkları": "Girişim Sermayesi Yat. Ort.",
+  "Spor Eğlence Boş Zamanları Değerlendirme Hizmetleri": "Spor ve Eğlence",
+  "Spor Faaliyetleri Eğlence ve Oyun Faaliyetleri": "Spor",
+  "İnsan Sağlığı ve Sosyal Hizmetler": "Sağlık Hizmetleri",
+  "Yaratıcı Sanatlar Gösteri Sanatları ve Eğlence Faaliyetleri": "Sanat ve Eğlence",
+  "Mimarlık ve Mühendislik Faaliyetleri; Teknik Muayene ve Analiz": "Mühendislik Hizmetleri",
+  "Reklamcılık ve Pazar Araştırması": "Reklamcılık",
+  "Seyahat Acentesi, Tur Operatörü ve Diğer Rezervasyon Hizmetleri İle İlgili Faaliyetler": "Seyahat Hizmetleri",
+  "Büro Yönetimi, Büro Desteği ve Diğer Şirket Destek Faaliyetleri": "Şirket Destek Hizmetleri",
+  "Elektrik Gaz ve Buhar": "Elektrik, Gaz ve Buhar",
+};
+const trTitle = (x) => String(x).toLocaleLowerCase("tr-TR").split(/\s+/)
+  .map((w, i) => (i > 0 && ["ve", "ile", "veya"].includes(w)) ? w : w.charAt(0).toLocaleUpperCase("tr-TR") + w.slice(1)).join(" ");
+const sectorLabel = (official) => { const t = trTitle(official); return SECTOR_SHORT[t] || t; };
+
+async function loadKapSectors() {
+  const prev = await readJson("sectors.json", null);
+  const fresh = prev && prev.updatedAt && Date.now() - Date.parse(prev.updatedAt) < SECTOR_MAX_AGE_DAYS * 864e5;
+  if (fresh && prev.map) { KAP_SECTORS = prev.map; return; }
+  try {
+    const r = await fetch("https://www.kap.org.tr/tr/Sektorler", {
+      headers: { "User-Agent": BROWSER_UA, "Accept-Language": "tr" },
+      signal: AbortSignal.timeout ? AbortSignal.timeout(25000) : undefined,
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const html = await r.text();
+    let payload = "";
+    for (const m of html.matchAll(/self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)/g)) {
+      try { payload += JSON.parse(m[1]); } catch { /* skip chunk */ }
+    }
+    const mains = {};
+    for (const m of payload.matchAll(/"mainSectorName":"([^"]+)","mainSectorOid":"[^"]*","mainSectorNo":"([^"]+)"/g)) mains[m[2]] = m[1];
+    const map = {};
+    for (const m of payload.matchAll(/\{"sectorName":"([^"]+)","sectorOid":"[^"]*","sectorNo":"([^"]*)","mkkMemberOid":"[^"]*","stockCode":"([^"]*)"/g)) {
+      const main = mains[m[2].split(".")[0] + "."];
+      for (const code of m[3].split(",").map((c) => c.trim())) {
+        if (/^[A-Z0-9]{3,6}$/.test(code) && !map[code]) map[code] = { s: sectorLabel(m[1]), m: main ? trTitle(main) : null };
+      }
+    }
+    if (Object.keys(map).length < 400) throw new Error("beklenenden az şirket: " + Object.keys(map).length);
+    KAP_SECTORS = map;
+    await fs.writeFile(path.join(DATA_DIR, "sectors.json"), JSON.stringify({ updatedAt: new Date().toISOString(), map }));
+    console.log("  KAP sektör sınıflaması: " + Object.keys(map).length + " şirket");
+  } catch (e) {
+    KAP_SECTORS = (prev && prev.map) || {};
+    console.log("  KAP sektörleri alınamadı (" + e.message + ") — önceki sınıflama kullanılıyor");
+  }
+}
+// Official sector onto a fundamentals map (in place). Keeps Yahoo's when KAP has no entry.
+function applyKapSectors(fund) {
+  for (const [sym, f] of Object.entries(fund || {})) {
+    const k = KAP_SECTORS[sym];
+    if (k && f) { f.sector = k.s; f.sectorMain = k.m; }
+  }
+  return fund;
+}
+
 function mapSector(s, sym) {
+  if (sym && KAP_SECTORS[sym]) return KAP_SECTORS[sym].s;
   if (sym && SECTOR_SYMBOL[sym]) return SECTOR_SYMBOL[sym];
   return s ? (SECTOR_TR[s] || s) : null;
 }
@@ -1516,6 +1597,19 @@ async function main() {
     await refreshMacroOnly(prevStocks);
     return;
   }
+  // Official BIST sector classification (weekly cache) before any sector is mapped.
+  await loadKapSectors();
+  // SECTORS_ONLY=1: refresh the classification now and re-label the stored
+  // fundamentals, nothing else (also for when KAP reclassifies a company).
+  if (process.env.SECTORS_ONLY === "1") {
+    for (const f of ["fundamentals.json", "fundamentalsExt.json"]) {
+      const cur = await readJson(f, null);
+      if (cur) await fs.writeFile(path.join(DATA_DIR, f), JSON.stringify(applyKapSectors(cur)));
+    }
+    console.log("sektörler uygulandı");
+    return;
+  }
+
 
   const todayStr = new Date().toISOString().slice(0, 10);
 
@@ -1748,7 +1842,7 @@ async function main() {
   await fs.writeFile(path.join(DATA_DIR, "history.json"), JSON.stringify(history));
   // Merge: a symbol Yahoo didn't return this run keeps its previous entry rather
   // than disappearing from the app (fundamentals write used to fully overwrite).
-  const mergedFund = { ...prevFundamentals, ...fundamentals };
+  const mergedFund = applyKapSectors({ ...prevFundamentals, ...fundamentals });
   await fs.writeFile(path.join(DATA_DIR, "fundamentals.json"), JSON.stringify(mergedFund));
   if (universe) await fs.writeFile(path.join(DATA_DIR, "universe.json"), JSON.stringify(universe));
   // Extended files are only rewritten on a FULL run — a fast run must never
@@ -1757,7 +1851,7 @@ async function main() {
     await fs.writeFile(path.join(DATA_DIR, "technicalsExt.json"), JSON.stringify(extended.technicals));
     await fs.writeFile(path.join(DATA_DIR, "pivotsExt.json"), JSON.stringify(extended.pivots));
     await fs.writeFile(path.join(DATA_DIR, "historyExt.json"), JSON.stringify(extended.history));
-    await fs.writeFile(path.join(DATA_DIR, "fundamentalsExt.json"), JSON.stringify(extended.fundamentals));
+    await fs.writeFile(path.join(DATA_DIR, "fundamentalsExt.json"), JSON.stringify(applyKapSectors(extended.fundamentals)));
     await fs.writeFile(path.join(DATA_DIR, "detailsExt.json"), JSON.stringify(extended.details));
     console.log("  extended dosyaları yazıldı: " + Object.keys(extended.history).length + " sembol");
   }
