@@ -609,8 +609,13 @@ function notNews(t) {
   if ((t.match(/!/g) || []).length >= 2) return true;
   return false;
 }
+// A dateline glued to the first paragraph ("03 Eki Cumartesi 2026 19:00 …") and
+// call-to-action sentences ("… aşağıdaki linkten takip edebilirsiniz.").
+const DATELINE = /^\d{1,2}\s+\S+\s+(?:\S+\s+)?\d{4}\s+\d{1,2}[:.]\d{2}\s+/;
+const CTA = /[^.!?]*(?:aşağıdaki (?:link|bağlantı)|takip edebilirsiniz|tıklayın|abone olun|bizi takip edin)[^.!?]*[.!?]?/gi;
 function cleanText(t) {
-  return String(t || "").replace(TEASER, "").replace(/[;:,\s]+$/, "").replace(/\s+/g, " ").trim();
+  return String(t || "").replace(/\s+/g, " ").trim().replace(DATELINE, "").replace(CTA, " ")
+    .replace(TEASER, "").replace(/[;:,\s]+$/, "").replace(/\s+/g, " ").trim();
 }
 // Near-duplicate check: the meta description is often the first paragraph again.
 const sameStart = (a, b) => normText(a).slice(0, 60) === normText(b).slice(0, 60);
@@ -714,6 +719,7 @@ const KAP_TEXT_MAX = 1500;
 // between, stop for the run at the first 429. The newest filings go first.
 const KAP_TEXT_PER_RUN = Number(process.env.KAP_TEXT_CAP) || 60;
 const KAP_TEXT_GAP_MS = 700;
+const KAP_TEXT_VERSION = 2; // 2: list items kept — older entries are fetched again (after new ones)
 const EN_WORDS = /\b(the|of|and|our|has|been|with|that|which|is|are|to|regarding|company)\b/gi;
 const isEnglish = (t) => (t.match(EN_WORDS) || []).length >= 3 && !/[çğışöüÇĞİŞÖÜ]/.test(t);
 const strip = (h) => decodeEntities(decodeEntities(String(h).replace(/<br\s*\/?>/gi, " ").replace(/<[^>]+>/g, " "))).replace(/\s+/g, " ").trim();
@@ -766,10 +772,13 @@ function kapTextFromHtml(html) {
     for (const l of labels) { if (l.at < m.index) lab = l; else break; }
     if (lab) push(lab.text, m[1]);
   }
+  // Paragraphs AND list items, in document order — explanations often say
+  // "… kararı ile;" and continue in a numbered list.
   const prose = [];
-  for (const m of payload.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)) {
-    const t = strip(m[1]);
-    if (t.length >= 40 && !isEnglish(t) && !/^oda_/.test(t) && !prose.includes(t)) prose.push(t);
+  for (const m of payload.matchAll(/<(p|li)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
+    const t = strip(m[2]);
+    const min = m[1].toLowerCase() === "li" ? 8 : 40;
+    if (t.length >= min && !isEnglish(t) && !/^oda_/.test(t) && !prose.includes(t)) prose.push(m[1].toLowerCase() === "li" ? "• " + t : t);
   }
   let text = "";
   for (const p of prose) {
@@ -791,13 +800,14 @@ async function enrichKapText(news, prev) {
   for (const items of Object.values(news || {})) {
     for (const it of items || []) {
       const id = /\/Bildirim\/(\d+)/.exec(it.url || "")?.[1];
-      if (!id || seenId.has(id) || out[id] || !(Date.parse(it.date) >= fetchAfter)) continue;
+      if (!id || seenId.has(id) || (out[id] && out[id].v === KAP_TEXT_VERSION) || !(Date.parse(it.date) >= fetchAfter)) continue;
       // Routine debt-instrument filings carry no reader text worth fetching.
       if (/finansman bonosu|borçlanma aracı|kira sertifikası|varant|pay dışında sermaye piyasası aracı/i.test(it.title || "")) continue;
       seenId.add(id); pending.push({ id, date: it.date });
     }
   }
-  pending.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  // Missing first (newest first), then entries made by older extraction rules.
+  pending.sort((a, b) => (out[a.id] ? 1 : 0) - (out[b.id] ? 1 : 0) || String(b.date).localeCompare(String(a.date)));
   let filled = 0, limited = false;
   for (const { id, date } of pending.slice(0, KAP_TEXT_PER_RUN)) {
     try {
@@ -808,7 +818,7 @@ async function enrichKapText(news, prev) {
       if (r.status === 429) { limited = true; break; }
       if (r.ok) {
         const x = kapTextFromHtml(await r.text());
-        if (x) { out[id] = { d: String(date).slice(0, 10), ...x }; filled++; }
+        if (x) { out[id] = { d: String(date).slice(0, 10), v: KAP_TEXT_VERSION, ...x }; filled++; }
       }
     } catch { /* next run */ }
     await new Promise((res) => setTimeout(res, KAP_TEXT_GAP_MS));
