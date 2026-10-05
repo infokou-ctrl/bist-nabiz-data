@@ -61,5 +61,5 @@ jobs:
               fi
               echo "push denemesi $i basarisiz - tekrar deniyor..."; sleep $((RANDOM % 10 + 6))
             done
-            echo "push 10 denemede basarisiz oldu"; exit 1
+            echo "::warning::push 10 denemede basarisiz - sonraki kosu tamamlayacak"; exit 0
           fi
