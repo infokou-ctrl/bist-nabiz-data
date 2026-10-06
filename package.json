@@ -8,6 +8,7 @@
     "refresh": "node refresh-cloud.mjs"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
     "yahoo-finance2": "^4.0.2"
   }
 }

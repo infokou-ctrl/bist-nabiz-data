@@ -12,6 +12,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkFundamentals } from "./lib/quality.mjs";
 import { evdsSeries, EVDS_CODES, EVDS_MACRO_CANDIDATES, yoyPct } from "./lib/evds.mjs";
+import { runKaplan } from "./lib/kaplan.mjs";
+
+// Kaplan (açıklayıcı analist) her koşunun sonunda; hatası koşuyu asla düşürmez.
+async function kaplanStep() {
+  try { await runKaplan(DATA_DIR); } catch (e) { console.log("Kaplan atlandı: " + (e?.message || e)); }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
@@ -1489,6 +1495,7 @@ async function refreshNewsOnly(prevStocks) {
 
   const mn = Object.values(marketNews.items || {}).filter((a) => a && a.length).length;
   console.log(`news-only yazıldı — KAP:${Object.keys(news).length} · piyasa:${mn}${marketNews.skipped ? " (piyasa/emtia saat kapısında atlandı)" : ""}`);
+  await kaplanStep();
 }
 
 // ---- macro-only refresh (EVDS) -------------------------------------------
@@ -1886,6 +1893,7 @@ async function main() {
     " · fx " + markets.fx.length + " · KAP-news " + newsCount + " · piyasa-haber " + mnCount + " · details " + Object.keys(details).length +
     "\n  (macro korundu)\n  updatedAt " + updatedAt,
   );
+  await kaplanStep();
 }
 
 main().catch((e) => { console.error("\nrefresh-cloud failed:", e); process.exit(1); });

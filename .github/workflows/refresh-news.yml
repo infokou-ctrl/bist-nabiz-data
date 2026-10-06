@@ -49,6 +49,8 @@ jobs:
         # takılıp hiç basın haberi çekmeden bitti.
         env:
           FORCE_NEWS: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          KAPLAN_MODEL: ${{ vars.KAPLAN_MODEL }}
       - name: Commit news
         if: steps.guard.outputs.paused == 'false'
         run: |
