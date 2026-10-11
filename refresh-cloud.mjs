@@ -11,12 +11,21 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkFundamentals } from "./lib/quality.mjs";
-import { evdsSeries, EVDS_CODES, EVDS_MACRO_CANDIDATES, yoyPct } from "./lib/evds.mjs";
+import { evdsSeries, EVDS_CODES, EVDS_MACRO_CANDIDATES, yoyPct, periodChangePct } from "./lib/evds.mjs";
 import { runKaplan } from "./lib/kaplan.mjs";
+import { parseKapFinancials } from "./lib/kap-financials.mjs";
+import { companyRecords, chartActions } from "./lib/company-records.mjs";
 
 // Kaplan (açıklayıcı analist) her koşunun sonunda; hatası koşuyu asla düşürmez.
 async function kaplanStep() {
-  try { await runKaplan(DATA_DIR); } catch (e) { console.log("Kaplan atlandı: " + (e?.message || e)); }
+  try {
+    const news = await readJson("news.json", {}), texts = await readJson("kapText.json", {});
+    const previous = await readJson("companyRecords.json", {companies:{}});
+    await fs.writeFile(path.join(DATA_DIR, "companyRecords.json"), JSON.stringify({
+      v: 1, generatedAt: new Date().toISOString(), source: "KAP", companies: companyRecords(news, texts, previous.companies)
+    }));
+    await runKaplan(DATA_DIR);
+  } catch (e) { console.log("Kaplan atlandı: " + (e?.message || e)); }
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -869,7 +878,7 @@ const KAP_TEXT_MAX = 1500;
 // between, stop for the run at the first 429. The newest filings go first.
 const KAP_TEXT_PER_RUN = Number(process.env.KAP_TEXT_CAP) || 60;
 const KAP_TEXT_GAP_MS = 700;
-const KAP_TEXT_VERSION = 2; // 2: list items kept — older entries are fetched again (after new ones)
+const KAP_TEXT_VERSION = 3; // 3: explicit financial facts and source retrieval time
 const EN_WORDS = /\b(the|of|and|our|has|been|with|that|which|is|are|to|regarding|company)\b/gi;
 const isEnglish = (t) => (t.match(EN_WORDS) || []).length >= 3 && !/[çğışöüÇĞİŞÖÜ]/.test(t);
 const strip = (h) => decodeEntities(decodeEntities(String(h).replace(/<br\s*\/?>/gi, " ").replace(/<[^>]+>/g, " "))).replace(/\s+/g, " ").trim();
@@ -936,8 +945,9 @@ function kapTextFromHtml(html) {
     text = text ? text + "\n\n" + p : p;
   }
   if (text.length > KAP_TEXT_MAX) text = text.slice(0, KAP_TEXT_MAX - 1).replace(/\s+\S*$/, "") + "…";
-  const f = fields.filter(([l]) => !prose.some((p) => p.includes(l))).slice(0, 12);
-  return text || f.length ? { t: text || null, f } : null;
+  const f = fields.filter(([l]) => !prose.some((p) => p.includes(l))).slice(0, 40);
+  const financials = parseKapFinancials(payload);
+  return text || f.length || financials ? { t: text || null, f, financials, fetchedAt: new Date().toISOString() } : null;
 }
 
 async function enrichKapText(news, prev) {
@@ -950,7 +960,7 @@ async function enrichKapText(news, prev) {
   for (const items of Object.values(news || {})) {
     for (const it of items || []) {
       const id = /\/Bildirim\/(\d+)/.exec(it.url || "")?.[1];
-      if (!id || seenId.has(id) || (out[id] && out[id].v === KAP_TEXT_VERSION) || !(Date.parse(it.date) >= fetchAfter)) continue;
+      if (!id || seenId.has(id) || (out[id] && out[id].v === KAP_TEXT_VERSION) || !(Date.parse(it.date) >= (/^finansal rapor(?:\s|$)/i.test(it.title || "") ? keepAfter : fetchAfter))) continue;
       // Routine debt-instrument filings carry no reader text worth fetching.
       if (/finansman bonosu|borçlanma aracı|kira sertifikası|varant|pay dışında sermaye piyasası aracı/i.test(it.title || "")) continue;
       seenId.add(id); pending.push({ id, date: it.date });
@@ -1039,6 +1049,7 @@ function financials(qs, fd) {
   if (!q.length && !y.length) return {};
   return {
     fin: {
+      source: "Yahoo Finance", updatedAt: new Date().toISOString(), currency: fd.financialCurrency || null,
       q, y,
       grossM: round(fd.grossMargins, 4),
       opM: round(fd.operatingMargins, 4),
@@ -1313,6 +1324,7 @@ async function buildExtended(coreSymbols) {
 
       const dts = rows.map((r) => r.date.toISOString().slice(0, 10));
       history[sym] = {
+        source: "Yahoo Finance", updatedAt: new Date().toISOString(), actions: chartActions(ch, new Date().toISOString()),
         s: dts[0], e: dts[dts.length - 1], d: dts, c: closes.map((c) => round(c, 2)),
         v: rows.map((r) => (r.volume != null ? Math.round(r.volume) : null)),
       };
@@ -1321,6 +1333,7 @@ async function buildExtended(coreSymbols) {
         const sd = qs.summaryDetail || {}, ks = qs.defaultKeyStatistics || {};
         const fd = qs.financialData || {}, ap = qs.assetProfile || {};
         fundamentals[sym] = {
+          source: "Yahoo Finance", updatedAt: new Date().toISOString(),
           sector: mapSector(ap.sector, sym),
           marketCap: sd.marketCap != null ? Math.round(sd.marketCap) : null,
           pe: round(sd.trailingPE, 2),
@@ -1372,6 +1385,7 @@ async function buildExtended(coreSymbols) {
         timeline.sort((a, b) => b.date.localeCompare(a.date));
 
         details[sym] = {
+          source: "Yahoo Finance", updatedAt: new Date().toISOString(),
           symbol: sym,
           name: nameOf[sym] || sym,
           annualDividend: sd.dividendRate != null ? round(sd.dividendRate, 4) : null,
@@ -1524,8 +1538,8 @@ async function refreshMacroOnly(prevStocks) {
   // 2) Patch the CPI rows in stocks.json.macro from the same series.
   const macro = Array.isArray(prevStocks.macro) ? prevStocks.macro.slice() : [];
   if (cpi.length >= 13) {
-    const last = cpi[cpi.length - 1], prev = cpi[cpi.length - 2];
-    const monthly = prev.value > 0 ? (last.value / prev.value - 1) * 100 : null;
+    const last = cpi[cpi.length - 1];
+    const monthly = periodChangePct(cpi, 1);
     const yearly = yoyPct(cpi);
     const label = trMonthLabel(last.date);
     for (const row of macro) {
@@ -1542,10 +1556,9 @@ async function refreshMacroOnly(prevStocks) {
   }
 
   // 3) Candidate macro series (policy rate / unemployment / current account).
-  // Fetch latest, log, and accept ONLY when the value is in a sane range. A wrong
-  // code (empty) or a mislabelled-but-valid code (insane value) is rejected.
+  // Only catalog-verified series may run; plausibility is an additional check.
   const key2 = process.env.EVDS_KEY;
-  for (const spec of EVDS_MACRO_CANDIDATES) {
+  for (const spec of EVDS_MACRO_CANDIDATES.filter((s) => s.verified === true)) {
     const s = await evdsSeries(key2, spec.code, "01-01-2023");
     if (!s.length) { console.log(`  [${spec.key}] ${spec.code}: veri yok → atlandı (kod yanlış olabilir, güven: ${spec.conf})`); continue; }
     const last = s[s.length - 1];
@@ -1657,12 +1670,14 @@ async function main() {
           modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents", "recommendationTrend", "earnings"],
         }).catch(() => null),
       ]);
+      const q = quotes[sym];
       if (qs) {
         const sd = qs.summaryDetail || {};
         const ks = qs.defaultKeyStatistics || {};
         const fd = qs.financialData || {};
         const ap = qs.assetProfile || {};
         fundamentals[sym] = {
+          source: "Yahoo Finance", updatedAt: new Date().toISOString(),
           sector: mapSector(ap.sector, sym),
           marketCap: sd.marketCap != null ? Math.round(sd.marketCap) : null,
           pe: round(sd.trailingPE, 2),
@@ -1693,6 +1708,7 @@ async function main() {
         const lastDivVal = ks.lastDividendValue != null ? round(ks.lastDividendValue, 4) : null;
         const prev = prevDetails[sym] || {};
         detailsOut[sym] = {
+          source: "Yahoo Finance", updatedAt: new Date().toISOString(),
           symbol: sym,
           name: prev.name || nameMap[sym] || q?.shortName || sym,
           annualDividend: sd.dividendRate != null ? round(sd.dividendRate, 4) : (prev.annualDividend ?? null),
@@ -1712,7 +1728,6 @@ async function main() {
       }
       const rows = (ch.quotes || []).filter((r) => r.close != null);
       const closes = rows.map((r) => r.close);
-      const q = quotes[sym];
       const price = q?.regularMarketPrice ?? closes[closes.length - 1] ?? null;
       const change = q?.regularMarketChangePercent ?? null;
       const volume = q?.regularMarketVolume ?? rows[rows.length - 1]?.volume ?? null;
@@ -1758,6 +1773,7 @@ async function main() {
       if (hrows.length >= 2) {
         const dts = hrows.map((r) => r.date.toISOString().slice(0, 10));
         history[sym] = {
+          source: "Yahoo Finance", updatedAt: new Date().toISOString(), actions: chartActions(ch, new Date().toISOString()),
           s: dts[0], e: dts[dts.length - 1], d: dts,
           o: hrows.map((r) => round(r.open, 2)), h: hrows.map((r) => round(r.high, 2)),
           l: hrows.map((r) => round(r.low, 2)), c: hrows.map((r) => round(r.close, 2)),
