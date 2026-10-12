@@ -13,7 +13,15 @@ on:
     # Saat başı yoğunluğundan kaçınır; koşu sayısı/bütçe artmaz. Kesin zaman garantisi değildir.
     - cron: "3-53/10 7-14 * * 1-5"
     - cron: "3,13 15 * * 1-5"
-  workflow_dispatch: {}
+  # Asıl zamanlayıcı artık Cloudflare (kod deposu wrangler.jsonc "triggers", 5 dk):
+  # GitHub'ın kendi zamanlayıcısı 12 Ekim'de seans boyunca hiç koşu başlatmadı.
+  # Yukarıdaki GitHub zamanlaması yedek olarak kalır. Cloudflare source=cron gönderir.
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Başlatan (manual = elle, cron = Cloudflare zamanlayıcısı)"
+        required: false
+        default: manual
 
 permissions:
   contents: write
@@ -34,7 +42,8 @@ jobs:
       - name: Duraklatma kilidi
         id: guard
         run: |
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ -f data/PAUSE ]; then
+          # Cloudflare zamanlayıcısı (source=cron) da otomatik sayılır → kilide uyar.
+          if { [ "${{ github.event_name }}" != "workflow_dispatch" ] || [ "${{ inputs.source }}" = "cron" ]; } && [ -f data/PAUSE ]; then
             echo "paused=true" >> "$GITHUB_OUTPUT"
             echo "⏸  data/PAUSE var — otomatik koşu atlandı. (Elle tetiklemede yok sayılır.)"
           else
