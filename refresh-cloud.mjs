@@ -1740,6 +1740,9 @@ async function main() {
         change: round(change, 2),
         rsi: round(rsi, 1),
         volume: volume != null ? Math.round(volume) : null,
+        // Kaynak işlem saati (21 Eki): canlı katman gelmese de uygulama fiyatın saatini bilsin
+        // ("Bu hissenin kaynak fiyat zamanı bilinmiyor" yazmasın). src/priceTime.ts quoteAt okur.
+        quoteAt: (() => { const t = q?.regularMarketTime; const ms = t instanceof Date ? t.getTime() : (typeof t === "number" ? t * 1000 : NaN); return Number.isFinite(ms) ? new Date(ms).toISOString() : null; })(),
       });
 
       const e20 = ema(closes, 20);
