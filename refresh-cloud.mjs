@@ -55,6 +55,27 @@ const readJson = async (name, fallback) => {
   }
 };
 
+// Yahoo günlük serinin SON mumunu kapanışı boş (null) gönderiyor; bugünün değerleri meta'da.
+// Eskiden bu mum atılıyordu → akşam koşusunda bile history.json ve göstergeler bir gün geride kalıyordu
+// (21 Eki, ISCTR: meta 13,08, son mum 12,86). Kapanışı boş son mum meta ile tamamlanır; yoksa eklenir.
+function withToday(ch) {
+  const rows = (ch?.quotes || []).filter((r) => r.close != null);
+  const m = ch?.meta || {}, price = m.regularMarketPrice, t = m.regularMarketTime;
+  const mt = t instanceof Date ? t : (typeof t === "number" ? new Date(t * 1000) : null);
+  if (!(price > 0) || !mt || isNaN(mt)) return rows;
+  const off = (typeof m.gmtoffset === "number" ? m.gmtoffset : 0) * 1000;
+  const day = (d) => new Date(d.getTime() + off).toISOString().slice(0, 10);
+  const want = day(mt), last = rows[rows.length - 1];
+  if (last && day(last.date) === want) { last.close = price; return rows; }
+  if (last && day(last.date) > want) return rows;
+  const raw = (ch.quotes || []).find((r) => r.date && day(r.date) === want);
+  const open = raw?.open ?? last?.close ?? price;
+  const hi = Math.max(open, price, m.regularMarketDayHigh ?? -Infinity, raw?.high ?? -Infinity);
+  const lo = Math.min(open, price, m.regularMarketDayLow ?? Infinity, raw?.low ?? Infinity);
+  rows.push({ date: raw?.date || mt, open, high: hi, low: lo, close: price, volume: m.regularMarketVolume ?? raw?.volume ?? null });
+  return rows;
+}
+
 // ---- indicators ----------------------------------------------------------
 function ema(values, period) {
   if (values.length < period) return null;
@@ -1093,7 +1114,7 @@ async function fetchIndexHistory(startDate) {
         yf.chart(d.yh, { period1: startDate, interval: "1d" }),
         yf.quote(d.yh).catch(() => null),
       ]);
-      const rows = (ch.quotes || []).filter((r) => r.close != null);
+      const rows = withToday(ch);
       if (rows.length < 100) continue;
       const ds = rows.map((r) => r.date.toISOString().slice(0, 10));
       out[d.code] = {
@@ -1136,7 +1157,7 @@ async function fetchFxHistory(startDate) {
   const out = {};
   const series = async (yhSymbol) => {
     const ch = await yf.chart(yhSymbol, { period1: startDate, interval: "1d" });
-    const rows = (ch.quotes || []).filter((r) => r.close != null);
+    const rows = withToday(ch);
     return {
       d: rows.map((r) => r.date.toISOString().slice(0, 10)),
       c: rows.map((r) => r.close),
@@ -1291,7 +1312,7 @@ async function buildExtended(coreSymbols) {
           modules: ["summaryDetail", "defaultKeyStatistics", "financialData", "assetProfile", "calendarEvents", "recommendationTrend", "earnings"],
         }).catch(() => null),
       ]);
-      const rows = (ch.quotes || []).filter((r) => r.close != null);
+      const rows = withToday(ch);
       if (rows.length < 30) return null; // too thin to compute anything honest
       const closes = rows.map((r) => r.close);
       const price = closes[closes.length - 1];
@@ -1726,7 +1747,7 @@ async function main() {
           timeline: (prev.timeline || []).map((t) => ({ ...t, future: t.date >= today })),
         };
       }
-      const rows = (ch.quotes || []).filter((r) => r.close != null);
+      const rows = withToday(ch);
       const closes = rows.map((r) => r.close);
       const price = q?.regularMarketPrice ?? closes[closes.length - 1] ?? null;
       const change = q?.regularMarketChangePercent ?? null;
